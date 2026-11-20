@@ -1,0 +1,10 @@
+build/
+*.zip
+*.user
+.vs/
+out/
+__pycache__/
+*.log
+savegame.json
+playthrough_save.json
+test_save.json

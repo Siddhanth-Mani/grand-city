@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (null renderer)
+        run: cmake -S . -B build -DGC6_RENDERER=null -DCMAKE_BUILD_TYPE=Release
+      - name: Build (-Wall -Wextra -Werror)
+        run: cmake --build build -j
+      - name: Tests
+        run: GC6_NO_AUDIO=1 ctest --test-dir build --output-on-failure
+      - name: Headless run
+        run: GC6_NO_AUDIO=1 ./build/grand-city-6 --headless --frames 600
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (Direct3D 12)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DGC6_RENDERER=d3d12
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Tests
+        shell: bash
+        run: GC6_NO_AUDIO=1 ./build/Release/gc6_tests.exe
