@@ -255,3 +255,8 @@ the time a new game starts at.
 - This is a complete, polished, original open-world game built on the
   engine — the closest achievable in this format. It is **not a finished
   AAA game**, and the real graphics need a Windows PC with a Direct3D 12 GPU.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Third-party libraries are listed in
+[THIRD_PARTY.md](THIRD_PARTY.md).
