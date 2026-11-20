@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 namespace gc6 {
-struct WindowDesc { int width = 1280, height = 720; std::string title = "Grand City 6"; bool fullscreen = false; };
+struct WindowDesc { int width = 1280, height = 720; std::string title = "Grand City 6"; bool fullscreen = false; bool noActivate = false; };
 // Platform window. Win32 on Windows; NullWindow elsewhere (headless/CI).
 class IWindow {
 public:

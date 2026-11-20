@@ -29,6 +29,27 @@ int Application::run(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--headless") headless_ = true;
         if (a == "--frames" && i + 1 < argc) headlessFrames_ = std::stoi(argv[++i]);
+        auto num = [&](float& out) { if (i + 1 < argc) out = std::stof(argv[++i]); };
+        if (a == "--shot" && i + 1 < argc) shot_.file = argv[++i];
+        if (a == "--hour") num(shot_.hour);
+        if (a == "--drive") num(shot_.drive);
+        if (a == "--steer") num(shot_.steer);
+        if (a == "--steer-at") num(shot_.steerAt);
+        if (a == "--wait") num(shot_.wait);
+        if (a == "--camera" && i + 1 < argc) shot_.camera = std::stoi(argv[++i]);
+        if (a == "--no-hud") shot_.hud = false;
+        if (a == "--weather" && i + 1 < argc) shot_.weather = argv[++i];
+        if (a == "--photo" && i + 3 < argc) {
+            shot_.photo = true;
+            shot_.photoYaw = std::stof(argv[++i]);
+            shot_.photoPitch = std::stof(argv[++i]);
+            shot_.photoDist = std::stof(argv[++i]);
+        }
+    }
+    const bool shotMode = !shot_.file.empty();
+    if (shotMode) {
+        config_.set("world", "startHour", std::to_string(shot_.hour));
+        if (!shot_.weather.empty()) config_.set("game", "weather", shot_.weather);
     }
     std::string rendererName = config_.getString("renderer", "backend", GC6_RENDERER_NAME);
     Logger::info(std::string("Grand City 6 starting, renderer=") + rendererName);
@@ -36,12 +57,18 @@ int Application::run(int argc, char** argv) {
     WindowDesc wd;
     wd.width = config_.getInt("window", "width", 1280);
     wd.height = config_.getInt("window", "height", 720);
+    wd.noActivate = shotMode;   // a scripted capture never steals the keyboard
     if (!window->create(wd)) { Logger::error("Window creation failed"); return 1; }
     auto renderer = createRenderer(rendererName, window->nativeHandle(), wd.width, wd.height);
     if (!renderer || !renderer->init()) { Logger::error("Renderer init failed"); return 1; }
     RenderDoc::init();
     world_.init(config_);
     if (headless_) world_.flow().setState(MenuState::Playing);
+    if (shotMode) {
+        world_.newGame();
+        world_.flow().setState(MenuState::Playing);
+    }
+    int shotFrame = 0;
     Clock clock;
     int frame = 0;
     bool running = true;
@@ -59,8 +86,33 @@ int Application::run(int argc, char** argv) {
         // frame advances exactly one physics step, so --frames N really
         // simulates N/60 seconds of game time instead of spinning through
         // N renders with almost no physics (real dt is ~0.02 ms/frame).
-        if (headless_) dt = 1.0 / 60.0;
+        if (headless_ || shotMode) dt = 1.0 / 60.0;
         if (!window->pollEvents(input_)) break;
+        bool captureNow = false;
+        if (shotMode) {
+            // Scripted input replaces the keyboard.
+            input_ = InputState{};
+            float t = static_cast<float>(shotFrame) / 60.0f;
+            float driveEnd = 0.3f + shot_.drive;
+            if (shotFrame == 10 && shot_.drive > 0.0f) input_.pressed[Key_E] = true;
+            if (shotFrame == 12) {
+                for (int k = 0; k < shot_.camera; ++k) world_.cycleCamera();
+            }
+            if (shot_.drive > 0.0f && t > 0.3f && t < driveEnd) {
+                input_.down[Key_W] = true;
+                if (t > shot_.steerAt + 0.3f) {
+                    if (shot_.steer < -0.05f) input_.down[Key_A] = true;
+                    if (shot_.steer > 0.05f) input_.down[Key_D] = true;
+                }
+            }
+            float total = driveEnd + shot_.settle + shot_.wait;
+            if (shot_.photo && t >= total - 0.1f && !world_.photoMode()) {
+                world_.togglePhotoMode();
+                world_.setPhotoCamera(shot_.photoYaw, shot_.photoPitch, shot_.photoDist);
+            }
+            captureNow = t >= total;
+            ++shotFrame;
+        }
         if (input_.wasPressed(Key_Escape) && world_.flow().state() == MenuState::Playing) {
             world_.flow().setState(MenuState::Paused);
             menu.selection = 0;
@@ -253,8 +305,10 @@ int Application::run(int argc, char** argv) {
         overlay.garageSelection = garageSelection;
         overlay.saveExists = saveExists;
         overlay.timeSeconds = wallClock += static_cast<float>(dt);
-        drawOverlay(*renderer, world_, overlay);
+        if (!shotMode || shot_.hud) drawOverlay(*renderer, world_, overlay);
+        if (captureNow) renderer->requestScreenshot(shot_.file);
         renderer->present();
+        if (captureNow) break;
         RenderDoc::endFrame();
         if (headless_ && ++frame >= headlessFrames_) break;
     }

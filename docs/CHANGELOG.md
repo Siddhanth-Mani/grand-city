@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## v3 — 2026-11-20 — realistic look
+
+- **Renderer rewrite (D3D12).** One physically based shader for everything:
+  GGX specular, Schlick Fresnel, clear-coat car paint, hemisphere ambient and
+  sky reflections. 2048² sun shadow map with 3×3 PCF, 4× MSAA, ACES tone
+  mapping, procedural sky (sun, moon, clouds, stars), fog matched to the sky.
+- **Lighting.** Real sun path (sunrise 06:00, sunset 19:00) with warm golden
+  hour, moonlight at night, 16 point lights: street lamps throw downward pools,
+  car headlights, police light bars. Lit windows and shopfronts at night,
+  blinking aircraft lights on towers, wet roads in rain.
+- **City.** Facade styles (concrete, glass tower, brick, stone) with
+  shopfronts and signs, podium towers with crowns and rooftop plant, kerbs,
+  pavement slabs, zebra crossings, stop lines, street lamps, trees and
+  traffic signals on every block.
+- **Cars.** Eight body styles lofted from side profiles with wheel arches and
+  bevels, separate glass, grille, skirts, diffuser, mirrors, plates,
+  full-width tail-light bars and five-spoke rims.
+- **People.** Articulated pedestrians (torso, head, hair, arms, legs, shoes)
+  with a walk cycle, varied outfits and skin tones, walking the pavements and
+  using the crossings.
+- **Capture mode.** `--shot FILE` with scripted time, weather, driving and
+  camera; the window opens without taking focus.
+- Tests: 148 checks, 0 failures.
 ## v2 — 2026-11-20
 
 The big "finish the game" upgrade. Everything below is real, working code

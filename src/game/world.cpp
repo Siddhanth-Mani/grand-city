@@ -146,7 +146,7 @@ void World::newGame() {
     garage_.init(catalogue_, 0);
     money_ = 0;
     playTimeMinutes_ = 0.0f;
-    timeOfDay_ = 10.0f;
+    timeOfDay_ = clampf(config_.getFloat("world", "startHour", 10.0f), 0.0f, 23.99f);
     wanted_.setHeat(0.0f);
     activities_.init(config_.getInt("world", "seed", 42));
     applyGarageCar();
@@ -382,32 +382,70 @@ void World::syncECS() {
 }
 void World::updateLights() {
     lightRig_.clear();
-    lightRig_.sunDir = Vec3(std::cos((timeOfDay_ / 24.0f) * 6.28318f),
-                            std::sin((timeOfDay_ / 24.0f) * 6.28318f), 0.3f);
-    lightRig_.sunColour = Vec3(1.0f, 0.9f, 0.8f);
-    lightRig_.sunIntensity = hud_.night ? 0.25f : 1.0f;
-    bool night = timeOfDay_ < 6.0f || timeOfDay_ > 19.0f;
-    // Headlights: player car + traffic cars ahead (forward list, max 16).
-    auto addHeadlight = [&](const Vehicle& v) {
+    Vec3 sunDir, sunColour;
+    float sunIntensity = 1.0f;
+    {
+        float dayFrac = (timeOfDay_ - 6.0f) / 13.0f;
+        if (dayFrac > 0.0f && dayFrac < 1.0f) {
+            float a = dayFrac * 3.14159265f;
+            sunDir = normalize(Vec3(-std::cos(a), std::sin(a) * 1.15f, 0.42f));
+            sunIntensity = sunDir.y > 0.05f ? 1.0f : 0.4f;
+        } else {
+            sunDir = normalize(Vec3(0.35f, 0.75f, -0.45f));
+            sunIntensity = 0.15f;
+        }
+        sunColour = Vec3(1.0f, 0.9f, 0.8f);
+    }
+    lightRig_.sunDir = sunDir;
+    lightRig_.sunColour = sunColour;
+    lightRig_.sunIntensity = sunIntensity;
+    bool dark = timeOfDay_ > 18.4f || timeOfDay_ < 6.6f;
+    Vec3 focus = player_.position();
+    // Police light bars first: they matter for gameplay at any time of day.
+    float t = playTimeMinutes_ * 60.0f;
+    for (const auto& c : police_.cars()) {
+        if (lightRig_.lights.size() >= 4) break;
+        if (length(c.position - focus) > 120.0f) continue;
+        DynamicLight l;
+        l.position = c.position + Vec3(0, 1.8f, 0);
+        l.colour = std::fmod(t, 0.5f) < 0.25f ? Vec3(1.0f, 0.1f, 0.05f) : Vec3(0.15f, 0.3f, 1.0f);
+        l.radius = 16.0f; l.intensity = 2.5f; l.isPolice = true;
+        lightRig_.add(l);
+    }
+    if (!dark) return;
+    // Headlights: a pool of light on the road ahead of each car.
+    auto addHeadlight = [&](const Vehicle& v, float strength) {
         Vec3 fwd{std::sin(v.yaw()), 0, std::cos(v.yaw())};
         DynamicLight l;
-        l.position = v.position() + fwd * 2.5f + Vec3(0, 0.8f, 0);
-        l.colour = Vec3(1.0f, 0.95f, 0.8f);
-        l.radius = 25.0f; l.intensity = night ? 2.0f : 0.8f; l.isHeadlight = true;
+        l.position = v.position() + fwd * 7.0f + Vec3(0, 1.2f, 0);
+        l.colour = Vec3(1.0f, 0.95f, 0.85f);
+        l.radius = 16.0f; l.intensity = strength; l.isHeadlight = true;
         lightRig_.add(l);
     };
-    if (player_.currentVehicle()) addHeadlight(*player_.currentVehicle());
-    for (const auto& c : traffic_.cars()) {
-        if (lightRig_.lights.size() >= LightRig::kMaxLights) break;
-        addHeadlight(c.vehicle);
+    if (player_.currentVehicle()) addHeadlight(*player_.currentVehicle(), 3.0f);
+    // The nearest streetlamps.
+    std::vector<std::pair<float, Vec3>> lamps;
+    for (const auto& p : city_.lamps) {
+        float d = length(p - focus);
+        if (d < 140.0f) lamps.push_back({d, p});
     }
-    for (const auto& c : police_.cars()) {
-        if (lightRig_.lights.size() >= LightRig::kMaxLights) break;
+    std::sort(lamps.begin(), lamps.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& lp : lamps) {
+        if (lightRig_.lights.size() >= 13) break;
         DynamicLight l;
-        l.position = c.position + Vec3(0, 1.2f, 0);
-        l.colour = Vec3(0.2f, 0.4f, 1.0f);
-        l.radius = 15.0f; l.intensity = 2.0f; l.isPolice = true;
+        l.position = lp.second + Vec3(0, City::kKerb - 0.3f, 0);
+        l.colour = Vec3(1.0f, 0.80f, 0.58f);
+        l.radius = 19.0f; l.intensity = 6.0f;
         lightRig_.add(l);
+    }
+    // Traffic headlights nearest the player fill what is left.
+    std::vector<std::pair<float, const Vehicle*>> cars;
+    for (const auto& c : traffic_.cars()) cars.push_back({length(c.vehicle.position() - focus), &c.vehicle});
+    std::sort(cars.begin(), cars.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& c : cars) {
+        if (lightRig_.lights.size() >= LightRig::kMaxLights) break;
+        if (c.first > 90.0f) break;
+        addHeadlight(*c.second, 1.6f);
     }
 }
 void World::updateAudio(float dt) {
@@ -521,8 +559,10 @@ void World::update(float dt, const InputState& input) {
     for (const auto& j : activities_.jumps()) hud_.rampPositions.push_back(j.position);
 }
 void World::rebuildScene() {
+    // The city is drawn straight from city_ in drawCity() (with culling and
+    // per-building materials); the flat scene list is kept for tools/tests.
     scene_.clear();
-    const MeshData& ground = resources_.groundPlane(city_.size);
+    const MeshData& ground = resources_.groundPlane(3000.0f);
     scene_.add("ground", &ground, Mat4(1.0f), Vec3(0.16f, 0.16f, 0.18f));
     const MeshData& box = resources_.box(1, 1, 1);
     for (const auto& b : city_.buildings) {
@@ -530,11 +570,9 @@ void World::rebuildScene() {
         Vec3 size = b.bounds.max - b.bounds.min;
         Mat4 model = translate(Mat4(1.0f), Vec3(centre.x, size.y / 2, centre.z));
         model = scale(model, size);
-        scene_.add("building", &box, model, b.colour);
+        SceneEntry& e = scene_.add("building", &box, model, b.colour);
+        e.visible = false;
     }
-    const MeshData& lamp = resources_.box(0.3f, 6.0f, 0.3f);
-    for (const auto& l : city_.lamps)
-        scene_.add("lamp", &lamp, translate(Mat4(1.0f), l + Vec3(0, 3, 0)), Vec3(0.9f, 0.85f, 0.6f));
 }
 Vec3 World::paintColour(int paintIndex, const std::string& baseColour) const {
     switch (paintIndex) {
@@ -547,58 +585,316 @@ Vec3 World::paintColour(int paintIndex, const std::string& baseColour) const {
         default: return colourFromName(baseColour);
     }
 }
+namespace {
+// Sun (day) or moon (night) for an hour of the day: direction towards the
+// light, its colour and intensity. Sunrise 06:00, sunset 19:00.
+void skyLight(float hour, Vec3& dir, Vec3& colour, float& intensity) {
+    float dayFrac = (hour - 6.0f) / 13.0f;
+    if (dayFrac > 0.0f && dayFrac < 1.0f) {
+        float a = dayFrac * 3.14159265f;
+        dir = normalize(Vec3(-std::cos(a), std::sin(a) * 1.15f, 0.42f));
+        float warm = 1.0f - clampf((dir.y - 0.04f) / 0.40f, 0.0f, 1.0f);
+        colour = Vec3(1.0f, 0.96f - 0.36f * warm, 0.90f - 0.58f * warm);
+        float t = clampf((dir.y + 0.02f) / 0.22f, 0.0f, 1.0f);
+        intensity = 0.15f + 0.85f * t * t * (3.0f - 2.0f * t);
+    } else {
+        dir = normalize(Vec3(0.35f, 0.75f, -0.45f));
+        colour = Vec3(0.55f, 0.65f, 0.95f);
+        intensity = 0.15f;
+    }
+}
+float hashf(float a, float b) {
+    float v = std::sin(a * 12.9898f + b * 78.233f) * 43758.5453f;
+    return v - std::floor(v);
+}
+Material mat(const Vec3& albedo, float rough, float metal = 0.0f, int shading = kShadeStandard) {
+    Material m;
+    m.albedo = albedo;
+    m.roughness = rough;
+    m.metalness = metal;
+    m.shading = shading;
+    return m;
+}
+Material glow(const Vec3& colour, float strength) {
+    Material m = mat(colour, 0.3f, 0.0f, kShadeEmissive);
+    m.emissive = colour * strength;
+    return m;
+}
+// Real-world car colour mix: white, black, greys and silver dominate.
+Vec3 trafficPaint(size_t i) {
+    static const Vec3 palette[] = {
+        {0.92f, 0.92f, 0.93f}, {0.03f, 0.03f, 0.035f}, {0.42f, 0.43f, 0.45f}, {0.70f, 0.71f, 0.73f},
+        {0.92f, 0.92f, 0.93f}, {0.06f, 0.10f, 0.25f}, {0.55f, 0.04f, 0.04f}, {0.03f, 0.03f, 0.035f},
+        {0.25f, 0.26f, 0.28f}, {0.62f, 0.58f, 0.50f}, {0.08f, 0.20f, 0.14f}, {0.70f, 0.71f, 0.73f},
+        {0.10f, 0.28f, 0.55f}, {0.92f, 0.92f, 0.93f}};
+    return palette[i % (sizeof(palette) / sizeof(palette[0]))];
+}
+const char* trafficClass(size_t i) {
+    static const char* classes[] = {"sedan", "hatch", "suv", "sedan", "van", "hatch", "pickup", "suv", "sedan", "sports"};
+    return classes[i % (sizeof(classes) / sizeof(classes[0]))];
+}
+struct PersonLook { Vec3 skin, top, legs, hair, shoes; };
+PersonLook lookFor(size_t i) {
+    static const Vec3 skins[] = {{0.87f, 0.68f, 0.55f}, {0.62f, 0.43f, 0.31f}, {0.42f, 0.28f, 0.19f},
+                                 {0.93f, 0.77f, 0.64f}, {0.30f, 0.20f, 0.14f}, {0.75f, 0.55f, 0.40f}};
+    static const Vec3 tops[] = {{0.08f, 0.10f, 0.16f}, {0.75f, 0.74f, 0.72f}, {0.45f, 0.08f, 0.08f},
+                                {0.12f, 0.30f, 0.45f}, {0.20f, 0.30f, 0.18f}, {0.05f, 0.05f, 0.05f},
+                                {0.60f, 0.48f, 0.30f}, {0.85f, 0.85f, 0.88f}, {0.35f, 0.18f, 0.40f},
+                                {0.80f, 0.55f, 0.10f}};
+    static const Vec3 legs[] = {{0.08f, 0.10f, 0.18f}, {0.05f, 0.05f, 0.05f}, {0.30f, 0.28f, 0.24f},
+                                {0.12f, 0.17f, 0.30f}, {0.45f, 0.40f, 0.32f}, {0.20f, 0.20f, 0.22f}};
+    static const Vec3 hair[] = {{0.04f, 0.03f, 0.02f}, {0.20f, 0.12f, 0.06f}, {0.45f, 0.32f, 0.16f},
+                                {0.10f, 0.08f, 0.06f}, {0.55f, 0.52f, 0.50f}};
+    return {skins[i % 6], tops[(i * 7 + 3) % 10], legs[(i * 5 + 1) % 6], hair[(i * 3 + 2) % 5],
+            (i % 3) ? Vec3(0.04f, 0.04f, 0.045f) : Vec3(0.85f, 0.85f, 0.85f)};
+}
+} // namespace
+
 void World::drawCar(IRenderer& renderer, const Vehicle& v, const Vec3& colour,
                     const std::string& carClass, bool headlightsOn) {
-    const MeshData& body = resources_.carBodyFor(carClass);
-    Mat4 model = translate(Mat4(1.0f), v.position());
+    drawCarStyled(renderer, v, colour, carClass, headlightsOn, false, true);
+}
+void World::drawCarStyled(IRenderer& renderer, const Vehicle& v, const Vec3& colour, const std::string& carClass,
+                          bool headlightsOn, bool police, bool drawGlass) {
+    const CarShape& s = ResourceManager::carShape(carClass);
+    Vec3 pos = v.position();
+    // Off the road the car sits on the kerb-height pavement.
+    pos.y += city_.groundHeight(pos) * (v.isAirborne() ? 0.0f : 1.0f);
+    Mat4 model = translate(Mat4(1.0f), pos);
     model = rotateY(model, v.yaw());
     model = rotateZ(model, v.bodyRoll());
     model = rotateX(model, v.bodyPitch());
-    const Material* paint = findMaterial(materials_, "carPaintRed");
-    if (paint) {
-        Material m = *paint;
-        m.albedo = colour;
-        renderer.drawMeshPBR(body, model, m);
-    } else {
-        renderer.drawMesh(body, model, colour);
+    Material paint = mat(colour, 0.38f, 0.35f, kShadeCarPaint);
+    renderer.drawMeshPBR(resources_.carBodyFor(carClass), model, paint);
+    if (drawGlass)
+        renderer.drawMeshPBR(resources_.carGlassFor(carClass), model, mat(Vec3(0.05f, 0.06f, 0.07f), 0.05f, 0.0f, kShadeGlass));
+    renderer.drawMeshPBR(resources_.carTrimFor(carClass), model, mat(Vec3(0.035f, 0.035f, 0.04f), 0.55f));
+    renderer.drawMeshPBR(resources_.carPlatesFor(carClass), model, mat(Vec3(0.85f, 0.84f, 0.78f), 0.4f));
+    if (headlightsOn)
+        renderer.drawMeshPBR(resources_.carHeadlightsFor(carClass), model, glow(Vec3(1.0f, 0.97f, 0.9f), 1.6f));
+    else
+        renderer.drawMeshPBR(resources_.carHeadlightsFor(carClass), model, mat(Vec3(0.72f, 0.75f, 0.78f), 0.1f, 0.6f));
+    if (headlightsOn)
+        renderer.drawMeshPBR(resources_.carTaillightsFor(carClass), model, glow(Vec3(0.85f, 0.03f, 0.02f), 0.9f));
+    else
+        renderer.drawMeshPBR(resources_.carTaillightsFor(carClass), model, mat(Vec3(0.45f, 0.02f, 0.02f), 0.08f));
+    if (police) {
+        float t = playTimeMinutes_ * 60.0f;
+        bool phase = std::fmod(t, 0.5f) < 0.25f;
+        Mat4 bar = translate(model, Vec3(0, s.roofY + 0.06f, (s.zW + s.zR) * 0.5f));
+        renderer.drawMeshPBR(resources_.box(1.1f, 0.05f, 0.24f), translate(bar, Vec3(0, -0.04f, 0)),
+                             mat(Vec3(0.05f, 0.05f, 0.05f), 0.5f));
+        renderer.drawMeshPBR(resources_.box(0.5f, 0.08f, 0.2f), translate(bar, Vec3(-0.27f, 0, 0)),
+                             phase ? glow(Vec3(1.0f, 0.08f, 0.05f), 2.5f) : mat(Vec3(0.4f, 0.05f, 0.05f), 0.2f));
+        renderer.drawMeshPBR(resources_.box(0.5f, 0.08f, 0.2f), translate(bar, Vec3(0.27f, 0, 0)),
+                             !phase ? glow(Vec3(0.1f, 0.25f, 1.0f), 2.5f) : mat(Vec3(0.05f, 0.08f, 0.4f), 0.2f));
     }
-    // Wheels: front pair steers, all four spin with speed.
-    const MeshData& wheel = resources_.wheel();
-    float spin = v.speed() * 0.1f; // accumulated visually per frame is fine
-    static const Vec3 offsets[4] = {{-0.9f, 0.35f, 1.4f}, {0.9f, 0.35f, 1.4f},
-                                    {-0.9f, 0.35f, -1.4f}, {0.9f, 0.35f, -1.4f}};
+    // Wheels: the front pair steers; all four roll with the car's speed.
+    float r = s.wheelRadius;
+    float spin = std::fmod(playTimeMinutes_ * 60.0f * v.speed() / r, 6.2831853f);
+    const MeshData& tyre = resources_.tyre(r);
+    const MeshData& rimMesh = resources_.rimFor(r);
+    Material rubber = mat(Vec3(0.025f, 0.025f, 0.028f), 0.85f);
+    Material alloy = carClass == "supercar" || carClass == "sports"
+                         ? mat(Vec3(0.18f, 0.18f, 0.2f), 0.3f, 1.0f)
+                         : mat(Vec3(0.78f, 0.79f, 0.8f), 0.25f, 1.0f);
     for (int i = 0; i < 4; ++i) {
-        Mat4 wm = model;
-        wm = translate(wm, offsets[static_cast<size_t>(i)]);
-        if (i < 2) wm = rotateY(wm, v.frontWheelAngle());
-        wm = rotateX(wm, spin);
-        renderer.drawMesh(wheel, wm, Vec3(0.05f, 0.05f, 0.05f));
+        bool front = i < 2;
+        float side = (i % 2 == 0) ? -1.0f : 1.0f;
+        Mat4 wm = translate(model, Vec3(side * s.wheelX(), r, front ? s.frontAxleZ() : s.rearAxleZ()));
+        if (front) wm = rotateY(wm, v.frontWheelAngle());
+        if (side < 0) wm = scale(wm, Vec3(-1, 1, 1));
+        wm = rotateX(wm, spin * side);
+        renderer.drawMeshPBR(tyre, wm, rubber);
+        renderer.drawMeshPBR(rimMesh, wm, alloy);
     }
-    // Mirrors + spoiler for the sporty classes.
-    const MeshData& mirror = resources_.mirror();
-    renderer.drawMesh(mirror, translate(model, Vec3(-1.05f, 0.75f, 0.9f)), Vec3(0.1f, 0.1f, 0.1f));
-    renderer.drawMesh(mirror, translate(model, Vec3(1.05f, 0.75f, 0.9f)), Vec3(0.1f, 0.1f, 0.1f));
-    if (carClass == "supercar" || carClass == "sports") {
-        const MeshData& spoiler = resources_.spoiler();
-        renderer.drawMesh(spoiler, translate(model, Vec3(0, 0.85f, -2.1f)), colour);
-    }
-    // Headlights / taillights: emissive when on (night or always for brake).
-    const MeshData& head = resources_.headlight();
-    const MeshData& tail = resources_.taillight();
-    Vec3 headColour = headlightsOn ? Vec3(1.0f, 0.95f, 0.8f) : Vec3(0.4f, 0.4f, 0.35f);
-    renderer.drawMesh(head, translate(model, Vec3(-0.7f, 0.55f, 2.25f)), headColour);
-    renderer.drawMesh(head, translate(model, Vec3(0.7f, 0.55f, 2.25f)), headColour);
-    renderer.drawMesh(tail, translate(model, Vec3(-0.7f, 0.6f, -2.25f)), Vec3(0.8f, 0.05f, 0.05f));
-    renderer.drawMesh(tail, translate(model, Vec3(0.7f, 0.6f, -2.25f)), Vec3(0.8f, 0.05f, 0.05f));
 }
+
+void World::drawPerson(IRenderer& renderer, const Vec3& feet, float yaw, float phase, float moving,
+                       size_t lookIndex) {
+    PersonLook look = lookFor(lookIndex);
+    Material skin = mat(look.skin, 0.6f), top = mat(look.top, 0.8f), legs = mat(look.legs, 0.85f);
+    Material hair = mat(look.hair, 0.7f), shoes = mat(look.shoes, 0.5f);
+    float amp = moving > 1.5f ? 0.9f : (moving > 0.5f ? 0.5f : 0.0f);
+    float bob = amp > 0.0f ? std::fabs(std::sin(phase)) * 0.035f * amp : 0.0f;
+    float hipY = 0.93f + bob - (amp > 0.8f ? 0.05f : 0.0f);
+    float scaleH = 0.94f + 0.12f * hashf(static_cast<float>(lookIndex), 3.0f);
+    Mat4 root = translate(Mat4(1.0f), feet);
+    root = rotateY(root, yaw);
+    root = scale(root, Vec3(scaleH));
+    Mat4 hips = translate(root, Vec3(0, hipY, 0));
+    float lean = amp > 0.8f ? 0.18f : 0.03f * amp;
+    Mat4 torso = rotateX(hips, lean);
+    renderer.drawMeshPBR(resources_.personTorso(), torso, top);
+    Mat4 neck = translate(torso, Vec3(0, 0.6f, 0.0f));
+    renderer.drawMeshPBR(resources_.personHead(), neck, skin);
+    renderer.drawMeshPBR(resources_.personHair(), neck, hair);
+    for (int sd = -1; sd <= 1; sd += 2) {
+        float legPhase = phase + (sd > 0 ? 0.0f : 3.14159265f);
+        float hip = std::sin(legPhase) * amp;
+        float knee = amp > 0.0f ? (0.1f + 0.7f * std::max(0.0f, -std::cos(legPhase))) * amp : 0.05f;
+        Mat4 thigh = translate(hips, Vec3(sd * 0.09f, 0, 0));
+        thigh = rotateX(thigh, -hip);
+        renderer.drawMeshPBR(resources_.personLimb(0.46f, 0.08f), thigh, legs);
+        Mat4 shin = translate(thigh, Vec3(0, -0.45f, 0));
+        shin = rotateX(shin, knee);
+        renderer.drawMeshPBR(resources_.personLimb(0.44f, 0.065f), shin, legs);
+        Mat4 foot = translate(shin, Vec3(0, -0.43f, 0));
+        foot = rotateX(foot, -knee * 0.5f + hip * 0.3f);
+        renderer.drawMeshPBR(resources_.personShoe(), foot, shoes);
+        Mat4 arm = translate(torso, Vec3(sd * 0.215f, 0.54f, 0));
+        arm = rotateZ(arm, sd * 0.07f);
+        arm = rotateX(arm, hip * 0.8f);
+        renderer.drawMeshPBR(resources_.personLimb(0.32f, 0.055f), arm, top);
+        Mat4 fore = translate(arm, Vec3(0, -0.3f, 0));
+        fore = rotateX(fore, -0.15f - (amp > 0.8f ? 1.2f : 0.25f * amp));
+        renderer.drawMeshPBR(resources_.personLimb(0.28f, 0.045f), fore, top);
+        renderer.drawMeshPBR(resources_.personHand(), translate(fore, Vec3(0, -0.27f, 0)), skin);
+    }
+}
+
+void World::drawCity(IRenderer& renderer, const Camera& cam) {
+    const Vec3 eye = cam.position;
+    Vec3 look = cam.target - cam.position;
+    const Vec3 fwd = length(look) > 1e-3f ? normalize(look) : Vec3(0, 0, 1);
+    auto visible = [&](const Vec3& c, float radius, float maxDist) {
+        Vec3 d = c - eye;
+        float dist = length(d);
+        if (dist - radius > maxDist) return false;
+        return dot(d, fwd) > -radius - 4.0f;   // not behind the camera
+    };
+    const float hour = timeOfDay_;
+    const bool lampsOn = hour > 18.4f || hour < 6.6f;
+    Material ground = mat(Vec3(0.3f, 0.3f, 0.3f), 0.9f, 0.0f, kShadeGround);
+    renderer.drawMeshPBR(resources_.groundPlane(3000.0f), Mat4(1.0f), ground);
+    // Raised blocks: kerbs + pavements + plazas (the beach strip has none).
+    const MeshData& unit = resources_.box(1, 1, 1);
+    const float s = city_.roadSpacing();
+    const int half = static_cast<int>(city_.size / 2);
+    for (int gx = -half; gx < half; gx += static_cast<int>(s))
+        for (int gz = -half + 40; gz < half; gz += static_cast<int>(s)) {
+            Vec3 c(gx + s / 2, City::kKerb / 2, gz + s / 2);
+            if (!visible(c, 19.0f, 700.0f)) continue;
+            Mat4 m = scale(translate(Mat4(1.0f), c), Vec3(s - 14.0f, City::kKerb, s - 14.0f));
+            renderer.drawMeshPBR(unit, m, ground);
+        }
+
+    // Buildings: facade shader + cornices, set-back towers, rooftop plant.
+    static const Vec3 concrete[] = {{0.62f, 0.60f, 0.56f}, {0.52f, 0.53f, 0.53f}, {0.70f, 0.66f, 0.58f}, {0.45f, 0.47f, 0.50f}};
+    static const Vec3 glassTint[] = {{0.32f, 0.44f, 0.50f}, {0.24f, 0.30f, 0.38f}, {0.40f, 0.42f, 0.38f}};
+    static const Vec3 brick[] = {{0.50f, 0.23f, 0.15f}, {0.56f, 0.34f, 0.24f}, {0.40f, 0.19f, 0.15f}};
+    static const Vec3 stone[] = {{0.74f, 0.68f, 0.57f}, {0.66f, 0.63f, 0.58f}, {0.80f, 0.76f, 0.68f}};
+    for (const auto& b : city_.buildings) {
+        Vec3 lo = b.bounds.min, hi = b.bounds.max;
+        Vec3 size = hi - lo;
+        Vec3 centre = (lo + hi) * 0.5f;
+        if (!visible(centre, length(size) * 0.5f, 700.0f)) continue;
+        size_t pick = static_cast<size_t>(b.seed * 97.0f);
+        Vec3 col = b.style == 1 ? glassTint[pick % 3]
+                 : b.style == 2 ? brick[pick % 3]
+                 : b.style == 3 ? stone[pick % 3] : concrete[pick % 4];
+        Material wall = mat(col, 0.8f, 0.0f, kShadeFacade);
+        wall.variant = static_cast<float>(b.style) + std::min(b.seed, 0.999f);
+        Material trim = mat(col * 0.75f, 0.7f);
+        float h = size.y;
+        float topY = h;
+        if (b.podium > 0.0f) {
+            Mat4 pm = scale(translate(Mat4(1.0f), Vec3(centre.x, b.podium / 2, centre.z)), Vec3(size.x, b.podium, size.z));
+            renderer.drawMeshPBR(unit, pm, wall);
+            float inset = 1.8f;
+            Vec3 ts(size.x - 2 * inset, h - b.podium, size.z - 2 * inset);
+            Mat4 tm = scale(translate(Mat4(1.0f), Vec3(centre.x, b.podium + ts.y / 2, centre.z)), ts);
+            renderer.drawMeshPBR(unit, tm, wall);
+            renderer.drawMeshPBR(unit, scale(translate(Mat4(1.0f), Vec3(centre.x, b.podium + 0.3f, centre.z)),
+                                             Vec3(size.x + 0.3f, 0.6f, size.z + 0.3f)), trim);
+            // Crown: a recessed plant screen on top of the tower.
+            Vec3 cs(ts.x * 0.8f, 3.2f, ts.z * 0.8f);
+            renderer.drawMeshPBR(unit, scale(translate(Mat4(1.0f), Vec3(centre.x, h + cs.y / 2, centre.z)), cs),
+                                 mat(Vec3(0.20f, 0.21f, 0.22f), 0.45f, 0.6f));
+            topY = h + cs.y;
+        } else {
+            Mat4 m = scale(translate(Mat4(1.0f), Vec3(centre.x, h / 2, centre.z)), size);
+            renderer.drawMeshPBR(unit, m, wall);
+            // Cornice / parapet.
+            renderer.drawMeshPBR(unit, scale(translate(Mat4(1.0f), Vec3(centre.x, h + 0.35f, centre.z)),
+                                             Vec3(size.x + 0.5f, 0.7f, size.z + 0.5f)), trim);
+            topY = h + 0.7f;
+        }
+        if (length(centre - eye) > 320.0f) continue;
+        // Rooftop plant: AC units, a water tank on older buildings, masts on towers.
+        Material plant = mat(Vec3(0.55f, 0.56f, 0.57f), 0.5f, 0.4f);
+        for (int k = 0; k < 3; ++k) {
+            float ox = (hashf(b.seed * 31.0f, static_cast<float>(k)) - 0.5f) * size.x * 0.5f;
+            float oz = (hashf(b.seed * 17.0f, static_cast<float>(k) + 5.0f) - 0.5f) * size.z * 0.5f;
+            renderer.drawMeshPBR(unit, scale(translate(Mat4(1.0f), Vec3(centre.x + ox, topY + 0.6f, centre.z + oz)),
+                                             Vec3(2.2f, 1.2f, 1.6f)), plant);
+        }
+        if (b.style == 2 || b.style == 3) {
+            Vec3 tp(centre.x + size.x * 0.22f, topY, centre.z - size.z * 0.2f);
+            renderer.drawMeshPBR(resources_.cylinder(1.3f, 2.4f), translate(Mat4(1.0f), tp + Vec3(0, 1.2f, 0)),
+                                 mat(Vec3(0.30f, 0.22f, 0.16f), 0.8f));
+            renderer.drawMeshPBR(resources_.cylinder(0.08f, 1.2f), translate(Mat4(1.0f), tp), plant);
+        }
+        if (b.style == 1 || h > 40.0f) {
+            renderer.drawMeshPBR(resources_.cylinder(0.12f, 9.0f), translate(Mat4(1.0f), Vec3(centre.x, topY, centre.z)), plant);
+            if (lampsOn || hour < 7.5f || hour > 17.5f)
+                renderer.drawMeshPBR(resources_.sphere(0.25f), translate(Mat4(1.0f), Vec3(centre.x, topY + 9.0f, centre.z)),
+                                     glow(Vec3(1.0f, 0.1f, 0.05f), std::fmod(playTimeMinutes_ * 60.0f, 2.0f) < 1.0f ? 2.0f : 0.3f));
+        }
+    }
+
+    // Street trees.
+    Material bark = mat(Vec3(0.24f, 0.18f, 0.13f), 0.9f);
+    for (size_t i = 0; i < city_.trees.size(); ++i) {
+        const Tree& t = city_.trees[i];
+        if (!visible(t.position + Vec3(0, 4, 0), 4.0f, 260.0f)) continue;
+        Mat4 m = translate(Mat4(1.0f), t.position + Vec3(0, City::kKerb, 0));
+        m = rotateY(m, static_cast<float>(i) * 1.7f);
+        m = scale(m, Vec3(t.scale));
+        renderer.drawMeshPBR(resources_.treeTrunk(), m, bark);
+        Vec3 leaf = (i % 3 == 0) ? Vec3(0.22f, 0.33f, 0.10f) : ((i % 3 == 1) ? Vec3(0.17f, 0.28f, 0.09f) : Vec3(0.26f, 0.32f, 0.12f));
+        renderer.drawMeshPBR(resources_.treeCanopy(t.variant), m, mat(leaf, 0.85f, 0.0f, kShadeFoliage));
+    }
+    // Streetlamps.
+    Material steel = mat(Vec3(0.16f, 0.17f, 0.18f), 0.45f, 0.7f);
+    for (const auto& l : city_.streetLamps) {
+        if (!visible(l.position + Vec3(0, 4, 0), 5.0f, 300.0f)) continue;
+        Mat4 m = translate(Mat4(1.0f), l.position + Vec3(0, City::kKerb, 0));
+        m = rotateY(m, l.yaw);
+        renderer.drawMeshPBR(resources_.lampPost(), m, steel);
+        Mat4 head = translate(m, Vec3(1.62f, 7.36f, 0));
+        renderer.drawMeshPBR(resources_.lampHead(), head, steel);
+        renderer.drawMeshPBR(resources_.box(0.5f, 0.02f, 0.2f), translate(head, Vec3(0, -0.055f, 0)),
+                             lampsOn ? glow(Vec3(1.0f, 0.86f, 0.66f), 2.2f) : mat(Vec3(0.75f, 0.75f, 0.72f), 0.2f));
+    }
+    // Traffic signals on two corners of each signalled junction.
+    Material signalPaint = mat(Vec3(0.12f, 0.13f, 0.12f), 0.55f, 0.3f);
+    for (const auto& tl : city_.lights) {
+        if (!visible(tl.position + Vec3(0, 3, 0), 10.0f, 260.0f)) continue;
+        for (int c = 0; c < 2; ++c) {
+            float sd = c == 0 ? 1.0f : -1.0f;
+            Mat4 m = translate(Mat4(1.0f), tl.position + Vec3(sd * 8.1f, City::kKerb, sd * 8.1f));
+            m = rotateY(m, c == 0 ? 3.14159265f : 0.0f);
+            renderer.drawMeshPBR(resources_.signalPole(), m, signalPaint);
+            Mat4 head = translate(m, Vec3(4.6f, 5.05f, 0));
+            renderer.drawMeshPBR(resources_.signalHead(), head, signalPaint);
+            const MeshData& lamp = resources_.sphere(0.1f);
+            renderer.drawMeshPBR(lamp, translate(head, Vec3(0, 0.29f, 0.12f)),
+                                 !tl.green ? glow(Vec3(1.0f, 0.06f, 0.03f), 3.0f) : mat(Vec3(0.18f, 0.03f, 0.03f), 0.2f));
+            renderer.drawMeshPBR(lamp, translate(head, Vec3(0, 0.0f, 0.12f)), mat(Vec3(0.2f, 0.14f, 0.03f), 0.2f));
+            renderer.drawMeshPBR(lamp, translate(head, Vec3(0, -0.29f, 0.12f)),
+                                 tl.green ? glow(Vec3(0.1f, 1.0f, 0.45f), 3.0f) : mat(Vec3(0.03f, 0.15f, 0.08f), 0.2f));
+        }
+    }
+}
+
 void World::render(IRenderer& renderer) {
-    // Sun: low at dawn/dusk, high at noon; warm colour at sunset.
-    float sunAngle = (timeOfDay_ / 24.0f) * 6.28318f;
-    Vec3 sunDir{std::cos(sunAngle), std::sin(sunAngle), 0.3f};
-    float warm = clampf(1.0f - std::fabs(timeOfDay_ - 18.0f) / 6.0f, 0.0f, 1.0f);
-    Vec3 sunColour{1.0f, 1.0f - 0.35f * warm, 1.0f - 0.6f * warm};
-    renderer.setSun(normalize(sunDir), sunColour, hud_.night ? 0.25f : 1.0f);
+    Vec3 sunDir, sunColour;
+    float sunIntensity = 1.0f;
+    skyLight(timeOfDay_, sunDir, sunColour, sunIntensity);
+    renderer.setSun(sunDir, sunColour, sunIntensity);
     renderer.setLights(lightRig_);
+    post_.wetness = weather_.state().wetness;
     renderer.setPostSettings(post_);
     renderer.setWireframe(debug_.wireframe);
     // Camera: chase (speed-sensitive FOV), hood, or cockpit.
@@ -608,27 +904,32 @@ void World::render(IRenderer& renderer) {
     Camera cam;
     cam.aspect = 16.0f / 9.0f;
     float speedKmh = player_.speedKmh();
+    bool inCar = player_.currentVehicle() != nullptr;
     if (hud_.photoMode) {
-        Vec3 target = playerPos;
+        Vec3 target = playerPos + Vec3(0, 0.8f, 0);
         cam.position = target + Vec3(std::sin(photoYaw_) * std::cos(photoPitch_),
                                      std::sin(photoPitch_), std::cos(photoYaw_) * std::cos(photoPitch_)) * photoDist_;
         cam.target = target;
-        cam.fov = 55.0f;
-    } else if (cameraMode_ == 2 && player_.currentVehicle()) {
+        cam.fov = 50.0f;
+    } else if (cameraMode_ == 2 && inCar) {
         // Cockpit: behind the dashboard, looking forward; the interior is
         // drawn in front of the camera.
         cam.position = playerPos + fwd * 0.4f + Vec3(0, 1.15f, 0);
         cam.target = playerPos + fwd * 30.0f + Vec3(0, 1.0f, 0);
         cam.fov = 70.0f + speedKmh * 0.08f;
-    } else if (cameraMode_ == 1 && player_.currentVehicle()) {
+    } else if (cameraMode_ == 1 && inCar) {
         cam.position = playerPos + fwd * 1.6f + Vec3(0, 1.1f, 0);
         cam.target = playerPos + fwd * 30.0f + Vec3(0, 0.8f, 0);
         cam.fov = 72.0f + speedKmh * 0.08f;
-    } else {
-        Vec3 eye = playerPos - fwd * 9.0f + Vec3(0, 3.5f, 0);
+    } else if (inCar) {
+        Vec3 eye = playerPos - fwd * 7.2f + Vec3(0, 2.4f, 0);
         cam.position = eye;
-        cam.target = playerPos + fwd * 4.0f;
-        cam.fov = 70.0f + speedKmh * 0.12f; // FOV widens with speed
+        cam.target = playerPos + fwd * 4.0f + Vec3(0, 0.9f, 0);
+        cam.fov = 62.0f + speedKmh * 0.10f; // FOV widens with speed
+    } else {
+        cam.position = playerPos - fwd * 4.2f + Vec3(0, 2.1f, 0);
+        cam.target = playerPos + fwd * 2.0f + Vec3(0, 1.3f, 0);
+        cam.fov = 60.0f;
     }
     if (screenShake_ > 0.01f) {
         cam.position.x += std::sin(playTimeMinutes_ * 400.0f) * screenShake_ * 0.15f;
@@ -636,59 +937,89 @@ void World::render(IRenderer& renderer) {
     }
     renderer.setCamera(cam);
     renderer.beginFrame();
-    scene_.render(renderer);
-    bool night = hud_.night;
+    drawCity(renderer, cam);
+    bool lightsOn = timeOfDay_ > 18.4f || timeOfDay_ < 6.6f || weather_.state().wetness > 0.5f;
+    auto near = [&](const Vec3& p, float d) { return length(p - cam.position) < d; };
     // Parked cars (garage cars), traffic, police.
     for (size_t i = 0; i < parkedCars_.size(); ++i) {
         const Vehicle& car = parkedCars_[i];
+        if (!near(car.position(), 400.0f)) continue;
         int ci = i < parkedCatalogueIndex_.size() ? parkedCatalogueIndex_[i] : 3;
         std::string cls = (ci >= 0 && ci < static_cast<int>(catalogue_.size()))
                               ? catalogue_[static_cast<size_t>(ci)].params.carClass : "sedan";
         Vec3 col = paintColour(garage_.paintIndex(),
                                (ci >= 0 && ci < static_cast<int>(catalogue_.size()))
                                    ? catalogue_[static_cast<size_t>(ci)].colourName : "grey");
-        drawCar(renderer, car, col, cls, night);
+        bool driving = player_.currentVehicle() == &car;
+        drawCarStyled(renderer, car, col, cls, driving && lightsOn, false, !(driving && cameraMode_ == 2));
     }
-    for (const auto& car : traffic_.cars())
-        drawCar(renderer, car.vehicle, Vec3(0.7f, 0.7f, 0.75f), "sedan", night);
+    const auto& traffic = traffic_.cars();
+    for (size_t i = 0; i < traffic.size(); ++i) {
+        if (!near(traffic[i].vehicle.position(), 400.0f)) continue;
+        drawCarStyled(renderer, traffic[i].vehicle, trafficPaint(i), trafficClass(i), lightsOn, false, true);
+    }
     for (const auto& car : police_.cars()) {
+        if (!near(car.position, 400.0f)) continue;
         Vehicle pv;
         pv.setPosition(car.position, car.yaw);
-        drawCar(renderer, pv, Vec3(0.1f, 0.15f, 0.9f), "sedan", true);
+        drawCarStyled(renderer, pv, Vec3(0.93f, 0.93f, 0.95f), "sedan", true, true, true);
     }
     // Player's own car: drawn only when it is the car being driven (a parked
     // car the player entered is already drawn in the parked loop above).
     if (player_.currentVehicle() && player_.currentVehicle() == player_.ownedVehicle()) {
         const Vehicle& v = *player_.currentVehicle();
-        drawCar(renderer, v,
-                paintColour(garage_.paintIndex(), catalogue_[static_cast<size_t>(garage_.currentCar())].colourName),
-                catalogue_[static_cast<size_t>(garage_.currentCar())].params.carClass, night);
+        drawCarStyled(renderer, v,
+                      paintColour(garage_.paintIndex(), catalogue_[static_cast<size_t>(garage_.currentCar())].colourName),
+                      catalogue_[static_cast<size_t>(garage_.currentCar())].params.carClass, lightsOn, false,
+                      cameraMode_ != 2);
     }
     // Cockpit interior: dashboard + steering wheel that turns with input.
-    if (cameraMode_ == 2 && player_.currentVehicle()) {
+    if (cameraMode_ == 2 && inCar) {
         const Vehicle& v = *player_.currentVehicle();
         Mat4 base = translate(Mat4(1.0f), playerPos + fwd * 0.4f + Vec3(0, 1.15f, 0));
         base = rotateY(base, playerYaw);
-        renderer.drawMesh(resources_.dashboard(), translate(base, Vec3(0, -0.15f, 0.9f)), Vec3(0.1f, 0.1f, 0.12f));
-        Mat4 wheel = translate(base, Vec3(0, -0.1f, 0.6f));
+        renderer.drawMeshPBR(resources_.dashboard(), translate(base, Vec3(0, -0.2f, 0.95f)), mat(Vec3(0.06f, 0.06f, 0.07f), 0.6f));
+        Mat4 wheel = translate(base, Vec3(-0.0f, -0.12f, 0.55f));
+        wheel = rotateX(wheel, -0.35f);
         wheel = rotateZ(wheel, -v.frontWheelAngle() * 2.0f);
-        renderer.drawMesh(resources_.steeringWheel(), wheel, Vec3(0.15f, 0.15f, 0.15f));
+        renderer.drawMeshPBR(resources_.steeringWheel(), wheel, mat(Vec3(0.05f, 0.05f, 0.055f), 0.5f));
     }
-    // Collectibles (gold boxes) and stunt ramps (orange wedges).
+    // Collectibles (glowing parcels) and stunt ramps.
     const MeshData& box = resources_.box(1, 1, 1);
+    float spinT = playTimeMinutes_ * 60.0f;
     for (const auto& item : activities_.items()) {
-        if (item.taken) continue;
-        renderer.drawMesh(box, translate(Mat4(1.0f), item.position + Vec3(0, 0.5f, 0)),
-                          Vec3(1.0f, 0.85f, 0.1f));
+        if (item.taken || !near(item.position, 250.0f)) continue;
+        Mat4 m = translate(Mat4(1.0f), item.position + Vec3(0, 0.8f + 0.15f * std::sin(spinT * 2.0f), 0));
+        m = rotateY(m, spinT);
+        renderer.drawMeshPBR(resources_.box(0.6f, 0.6f, 0.6f), m, glow(Vec3(1.0f, 0.78f, 0.15f), 0.8f));
     }
     for (const auto& j : activities_.jumps()) {
+        if (!near(j.position, 300.0f)) continue;
         Mat4 ramp = translate(Mat4(1.0f), j.position + Vec3(0, 0.6f, 0));
-        renderer.drawMesh(box, ramp, Vec3(0.95f, 0.4f, 0.05f));
+        renderer.drawMeshPBR(box, ramp, mat(Vec3(0.95f, 0.45f, 0.08f), 0.6f));
     }
-    const MeshData& personMesh = resources_.person();
-    for (const auto& p : pedestrians_.all())
-        renderer.drawMesh(personMesh, translate(Mat4(1.0f), p.position), Vec3(0.9f, 0.8f, 0.6f));
-    if (player_.onFoot())
-        renderer.drawMesh(personMesh, translate(Mat4(1.0f), player_.position()), Vec3(0.9f, 0.5f, 0.1f));
+    // Pedestrians on the pavements.
+    const auto& peds = pedestrians_.all();
+    for (size_t i = 0; i < peds.size(); ++i) {
+        const Pedestrian& p = peds[i];
+        if (!near(p.position, 160.0f)) continue;
+        Vec3 feet = p.position;
+        feet.y = city_.groundHeight(p.position);
+        drawPerson(renderer, feet, p.yaw, p.phase, p.moving, i + 11);
+    }
+    if (player_.onFoot()) {
+        Vec3 pp = player_.position();
+        Vec3 step = pp - lastFootPos_;
+        step.y = 0.0f;
+        float moved = length(step);
+        footPhase_ += moved * 3.6f;
+        footMoving_ = moved > 0.002f ? std::min(2.0f, moved * 60.0f / 1.6f) : 0.0f;
+        lastFootPos_ = pp;
+        Vec3 feet = pp;
+        feet.y = city_.groundHeight(pp);
+        drawPerson(renderer, feet, player_.yaw(), footPhase_, footMoving_ > 0.1f ? std::max(1.0f, footMoving_) : 0.0f, 0);
+    } else {
+        lastFootPos_ = player_.position();
+    }
 }
 } // namespace gc6

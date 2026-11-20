@@ -1,19 +1,25 @@
 #ifdef _WIN32
 // Direct3D 12 backend.
 //
-// What it draws:
-//   * every mesh the game submits (procedural city, cars, people), flat-shaded
-//     with a directional sun, sky/ground ambient and distance fog;
-//   * the ground as a procedural road grid (asphalt, lane markings, pavements,
-//     beach and sea) worked out per pixel from the world position;
-//   * a 2D overlay (menus, HUD, minimap) on top, using a font atlas rendered
-//     with GDI at start-up.
+// Frame structure:
+//   1. sun shadow pass: every shadow caster into a 2048^2 depth map from an
+//      orthographic sun camera that follows the player (snapped to texels so
+//      shadows do not shimmer);
+//   2. main pass into a 4x MSAA target: a procedural sky (gradient, sun, moon,
+//      clouds, stars) and then the scene, lit with GGX + sky reflections +
+//      PCF shadows + up to 16 point lights, ACES tone mapped (shaders in
+//      d3d12_shaders.h);
+//   3. MSAA resolve into the swap-chain buffer, then the 2D overlay (menus,
+//      HUD, minimap) with a font atlas rendered with GDI at start-up.
 //
-// Structure: 2 frames in flight, one fence value per frame, one persistently
-// mapped upload ring per frame for constants and overlay vertices, and a
-// mesh cache that uploads each MeshData once (keyed by its address; the
-// ResourceManager owns meshes for the whole run).
+// Draw calls are recorded into a list during the frame and replayed in
+// present(), so the same draws feed both the shadow and the main pass.
+// 2 frames in flight, one persistently mapped upload ring per frame for
+// constants and overlay vertices, and a mesh cache that uploads each
+// MeshData once (keyed by its address; the ResourceManager owns meshes for
+// the whole run).
 #include "renderer/d3d12/d3d12_renderer.h"
+#include "renderer/d3d12/d3d12_shaders.h"
 #include "core/logger.h"
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -21,7 +27,9 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 using Microsoft::WRL::ComPtr;
@@ -30,100 +38,31 @@ namespace {
 constexpr UINT kFrames = 2;
 constexpr UINT64 kRingBytes = 8ull * 1024 * 1024; // per frame
 constexpr float kCanvasW = 1280.0f, kCanvasH = 720.0f;
+constexpr UINT kShadowSize = 2048;
+constexpr float kShadowHalf = 70.0f;   // metres covered either side of the focus
+constexpr DXGI_FORMAT kColourFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 // Font atlas: printable ASCII (32..127) in a 16 x 6 grid of 32 x 64 cells,
 // glyphs rendered at a 48 px em. A glyph drawn at "size" px advances 0.55 x size.
 constexpr int kCellW = 32, kCellH = 64, kAtlasW = 16 * kCellW, kAtlasH = 6 * kCellH;
 constexpr float kEm = 48.0f;
 
-const char* kShaderSource = R"HLSL(
-cbuffer Frame : register(b0) {
-    float4x4 viewProj;
-    float4 camPos;      // xyz camera, w fog density
-    float4 sunDir;      // xyz towards the sun, w intensity
-    float4 sunColour;   // rgb, w night factor (0 day .. 1 night)
-    float4 skyColour;   // rgb horizon / fog colour
-};
-cbuffer Draw : register(b1) {
-    float4x4 model;
-    float4 colour;      // rgb albedo, w emissive strength
-};
-Texture2D fontTex : register(t0);
-SamplerState samp : register(s0);
-
-struct V3 { float4 pos : SV_Position; float3 world : TEXCOORD0; };
-V3 VSMain(float3 pos : POSITION) {
-    V3 o;
-    float4 w = mul(model, float4(pos, 1.0));
-    o.world = w.xyz;
-    o.pos = mul(viewProj, w);
-    return o;
-}
-float band(float v, float lo, float hi) { return step(lo, v) * step(v, hi); }
-// Procedural city ground: 14 m roads every 40 m, dashed centre lines,
-// pavements, grass inside the blocks, beach and sea along the south edge.
-float3 groundColour(float2 p) {
-    if (p.y < -196.0) return float3(0.10, 0.28, 0.42);           // sea
-    if (p.y < -160.0) return float3(0.74, 0.67, 0.49);           // beach
-    float s = 40.0;
-    float2 m = abs(p) % s;                                         // 0..40 within a block
-    float2 d = min(m, s - m);                                      // distance to the road centre
-    bool roadX = d.x < 7.0, roadZ = d.y < 7.0;
-    if (roadX || roadZ) {
-        float3 c = float3(0.085, 0.09, 0.10);
-        bool junction = roadX && roadZ;
-        if (!junction) {
-            float along = roadX ? p.y : p.x;
-            float across = roadX ? d.x : d.y;
-            float dash = step(frac(along / 6.0), 0.5);
-            c = lerp(c, float3(0.85, 0.72, 0.18), band(across, 0.0, 0.12) * dash); // centre line
-            c = lerp(c, float3(0.80, 0.80, 0.78), band(across, 6.3, 6.5));        // edge line
-        }
-        return c;
-    }
-    if (d.x < 9.5 || d.y < 9.5) return float3(0.42, 0.42, 0.40);   // pavement
-    return float3(0.20, 0.30, 0.15);                               // grass
-}
-float4 PSMain(V3 i) : SV_Target {
-    float3 n = normalize(cross(ddx(i.world), ddy(i.world)));
-    float3 toCam = camPos.xyz - i.world;
-    if (dot(n, toCam) < 0.0) n = -n;
-    float3 albedo = colour.rgb;
-    if (i.world.y < 0.05 && n.y > 0.9) albedo = groundColour(i.world.xz);
-    float3 L = normalize(float3(sunDir.x, max(sunDir.y, 0.45), sunDir.z));
-    float diffuse = saturate(dot(n, L)) * sunDir.w;
-    float3 ambient = lerp(float3(0.20, 0.19, 0.17), skyColour.rgb, n.y * 0.5 + 0.5) * 0.55;
-    float3 c = albedo * (ambient + sunColour.rgb * diffuse) + albedo * colour.w;
-    float dist = length(toCam);
-    float fog = 1.0 - exp(-dist * camPos.w);
-    c = lerp(c, skyColour.rgb, saturate(fog));
-    return float4(pow(saturate(c), 1.0 / 1.25), 1.0);
-}
-
-struct V2 { float4 pos : SV_Position; float2 uv : TEXCOORD0; float4 col : COLOR0; };
-V2 VSOverlay(float2 pos : POSITION, float2 uv : TEXCOORD0, float4 col : COLOR0) {
-    V2 o;
-    o.pos = float4(pos, 0.0, 1.0);
-    o.uv = uv;
-    o.col = col;
-    return o;
-}
-float4 PSOverlay(V2 i) : SV_Target {
-    if (i.uv.x < 0.0) return i.col;
-    float a = fontTex.Sample(samp, i.uv).r;
-    return float4(i.col.rgb, i.col.a * a);
-}
-)HLSL";
-
 struct FrameConstants {
     float viewProj[16];
+    float shadowVP[16];
+    float invViewProj[16];
     float camPos[4];
     float sunDir[4];
     float sunColour[4];
-    float skyColour[4];
+    float skyZenith[4];
+    float skyHorizon[4];
+    float misc[4];
+    float lightPos[16][4];
+    float lightCol[16][4];
 };
 struct DrawConstants {
     float model[16];
     float colour[4];
+    float params[4];
 };
 struct OverlayVertex {
     float x, y, u, v;
@@ -135,6 +74,11 @@ struct GpuMesh {
     D3D12_INDEX_BUFFER_VIEW ibv{};
     UINT indexCount = 0;
     size_t sourceVertices = 0, sourceIndices = 0;
+};
+struct DrawItem {
+    GpuMesh* mesh = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS constants = 0;
+    bool castsShadow = true;
 };
 
 ComPtr<ID3D12Resource> makeUploadBuffer(ID3D12Device* device, UINT64 bytes) {
@@ -153,8 +97,26 @@ ComPtr<ID3D12Resource> makeUploadBuffer(ID3D12Device* device, UINT64 bytes) {
         return nullptr;
     return res;
 }
+ComPtr<ID3D12Resource> makeTexture(ID3D12Device* device, DXGI_FORMAT format, UINT w, UINT h, UINT samples,
+                                   D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,
+                                   const D3D12_CLEAR_VALUE* clear) {
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = format;
+    td.SampleDesc.Count = samples;
+    td.Flags = flags;
+    ComPtr<ID3D12Resource> res;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, state, clear,
+                                               IID_PPV_ARGS(&res))))
+        return nullptr;
+    return res;
+}
 void transition(ID3D12GraphicsCommandList* cmd, ID3D12Resource* res,
                 D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    if (from == to) return;
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = res;
@@ -174,19 +136,22 @@ bool compile(const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
     }
     return true;
 }
+Vec3 mix3(const Vec3& a, const Vec3& b, float t) { return a + (b - a) * t; }
 } // namespace
 
 struct D3D12Renderer::Impl {
     HWND hwnd = nullptr;
     int width = 1280, height = 720;
     UINT frameIndex = 0;
+    UINT samples = 4;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> swapChain;
     ComPtr<ID3D12Resource> backBuffers[kFrames];
     ComPtr<ID3D12DescriptorHeap> rtvHeap, dsvHeap, srvHeap;
-    UINT rtvStride = 0;
-    ComPtr<ID3D12Resource> depth;
+    UINT rtvStride = 0, dsvStride = 0, srvStride = 0;
+    ComPtr<ID3D12Resource> sceneColour, sceneDepth, shadowMap;
+    D3D12_RESOURCE_STATES shadowState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     ComPtr<ID3D12CommandAllocator> allocators[kFrames];
     ComPtr<ID3D12GraphicsCommandList> cmd;
     ComPtr<ID3D12Fence> fence;
@@ -194,7 +159,7 @@ struct D3D12Renderer::Impl {
     UINT64 fenceCounter = 0;
     UINT64 frameFence[kFrames] = {};
     ComPtr<ID3D12RootSignature> rootSig;
-    ComPtr<ID3D12PipelineState> psoScene, psoSceneWire, psoOverlay;
+    ComPtr<ID3D12PipelineState> psoScene, psoSceneWire, psoSky, psoShadow, psoOverlay;
     ComPtr<ID3D12Resource> fontTexture;
     // Upload ring: kFrames slices of kRingBytes, persistently mapped.
     ComPtr<ID3D12Resource> ring;
@@ -202,17 +167,30 @@ struct D3D12Renderer::Impl {
     UINT64 ringOffset = 0;
     bool ringFullWarned = false;
     std::unordered_map<const MeshData*, GpuMesh> meshes;
+    std::vector<DrawItem> items;
     std::vector<OverlayVertex> overlay;
     Camera camera;
     Vec3 sunDir{0, 1, 0}, sunColour{1, 1, 1};
     float sunIntensity = 1.0f;
+    std::vector<DynamicLight> lights;
+    PostSettings post;
     bool wireframe = false;
     bool frameOpen = false;
     size_t draws = 0;
+    LARGE_INTEGER startTime{}, frequency{};
+    std::string screenshotPath;   // non-empty: save the next frame
+    ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT readbackFootprint{};
+    void saveReadback();
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv(UINT i) const {
         D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
         h.ptr += static_cast<SIZE_T>(i) * rtvStride;
+        return h;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv(UINT i) const {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = dsvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(i) * dsvStride;
         return h;
     }
     void waitIdle() {
@@ -237,13 +215,27 @@ struct D3D12Renderer::Impl {
         gpu = ring->GetGPUVirtualAddress() + base + off;
         return true;
     }
+    // Vertex format: position + normal (6 floats). Meshes without normals
+    // upload zeros; the pixel shader then falls back to a face normal.
     GpuMesh* mesh(const MeshData& m) {
         auto it = meshes.find(&m);
         if (it != meshes.end() && it->second.sourceVertices == m.positions.size() &&
             it->second.sourceIndices == m.indices.size())
             return &it->second;
         GpuMesh g;
-        UINT64 vbBytes = m.positions.size() * sizeof(float) * 3;
+        std::vector<float> verts(m.positions.size() * 6, 0.0f);
+        bool hasNormals = m.normals.size() == m.positions.size();
+        for (size_t i = 0; i < m.positions.size(); ++i) {
+            verts[i * 6 + 0] = m.positions[i].x;
+            verts[i * 6 + 1] = m.positions[i].y;
+            verts[i * 6 + 2] = m.positions[i].z;
+            if (hasNormals) {
+                verts[i * 6 + 3] = m.normals[i].x;
+                verts[i * 6 + 4] = m.normals[i].y;
+                verts[i * 6 + 5] = m.normals[i].z;
+            }
+        }
+        UINT64 vbBytes = verts.size() * sizeof(float);
         UINT64 ibBytes = m.indices.size() * sizeof(uint32_t);
         g.vb = makeUploadBuffer(device.Get(), vbBytes);
         g.ib = makeUploadBuffer(device.Get(), ibBytes);
@@ -251,12 +243,12 @@ struct D3D12Renderer::Impl {
         void* p = nullptr;
         D3D12_RANGE none{0, 0};
         g.vb->Map(0, &none, &p);
-        std::memcpy(p, m.positions.data(), vbBytes);
+        std::memcpy(p, verts.data(), vbBytes);
         g.vb->Unmap(0, nullptr);
         g.ib->Map(0, &none, &p);
         std::memcpy(p, m.indices.data(), ibBytes);
         g.ib->Unmap(0, nullptr);
-        g.vbv = {g.vb->GetGPUVirtualAddress(), static_cast<UINT>(vbBytes), sizeof(float) * 3};
+        g.vbv = {g.vb->GetGPUVirtualAddress(), static_cast<UINT>(vbBytes), sizeof(float) * 6};
         g.ibv = {g.ib->GetGPUVirtualAddress(), static_cast<UINT>(ibBytes), DXGI_FORMAT_R32_UINT};
         g.indexCount = static_cast<UINT>(m.indices.size());
         g.sourceVertices = m.positions.size();
@@ -268,14 +260,95 @@ struct D3D12Renderer::Impl {
         slot = std::move(g);
         return &slot;
     }
-    Vec3 sky() const {
-        float day = clampf((sunIntensity - 0.25f) / 0.75f, 0.0f, 1.0f);
-        Vec3 dayCol{0.62f, 0.74f, 0.88f}, nightCol{0.035f, 0.045f, 0.09f};
-        return nightCol + (dayCol - nightCol) * day;
+    float nightFactor() const { return clampf(1.0f - (sunIntensity - 0.15f) / 0.6f, 0.0f, 1.0f); }
+    void skyColours(Vec3& zenith, Vec3& horizon) const {
+        float night = nightFactor();
+        float elev = normalize(sunDir).y;
+        float dusk = (1.0f - night) * clampf(1.0f - elev / 0.35f, 0.0f, 1.0f);
+        Vec3 zen = mix3(Vec3(0.10f, 0.25f, 0.62f), Vec3(0.16f, 0.20f, 0.42f), dusk);
+        Vec3 hor = mix3(Vec3(0.50f, 0.64f, 0.82f), Vec3(0.95f, 0.50f, 0.25f), dusk);
+        zen = mix3(zen, Vec3(0.003f, 0.006f, 0.018f), night);
+        hor = mix3(hor, Vec3(0.020f, 0.030f, 0.055f), night);
+        // Rain: an overcast, grey sky.
+        float wet = clampf(post.wetness, 0.0f, 1.0f) * 0.75f;
+        float lz = (zen.x + zen.y + zen.z) / 3.0f, lh = (hor.x + hor.y + hor.z) / 3.0f;
+        zenith = mix3(zen, Vec3(lz, lz, lz * 1.05f) * 1.1f, wet);
+        horizon = mix3(hor, Vec3(lh, lh, lh * 1.05f), wet);
     }
+    void buildFrameConstants(FrameConstants& fc) const;
+    void submit(const MeshData& mesh, const Mat4& model, const float colour[4], const float params[4],
+                bool castsShadow);
     bool createFontAtlas();
     bool createPipelines();
+    bool createTargets();
 };
+
+void D3D12Renderer::Impl::buildFrameConstants(FrameConstants& fc) const {
+    std::memset(&fc, 0, sizeof(fc));
+    const Camera& c = camera;
+    float aspect = static_cast<float>(width) / static_cast<float>(height);
+    Mat4 proj = glm::perspectiveRH_ZO(glm::radians(c.fov), aspect, std::max(c.nearPlane, 0.1f), c.farPlane);
+    Mat4 vpm = proj * c.view();
+    Mat4 inv = glm::inverse(vpm);
+    std::memcpy(fc.viewProj, &vpm[0][0], sizeof(fc.viewProj));
+    std::memcpy(fc.invViewProj, &inv[0][0], sizeof(fc.invViewProj));
+
+    // Sun shadow camera: orthographic, centred just ahead of the camera
+    // target, snapped to whole shadow-map texels.
+    Vec3 L = normalize(sunDir);
+    if (L.y < 0.18f) { L.y = 0.18f; L = normalize(L); }
+    Vec3 look = c.target - c.position;
+    look.y = 0.0f;
+    Vec3 focus = c.target + (length(look) > 0.01f ? normalize(look) * 18.0f : Vec3(0.0f));
+    focus.y = 0.0f;
+    Vec3 up = std::fabs(L.y) > 0.98f ? Vec3(0, 0, 1) : Vec3(0, 1, 0);
+    Mat4 lview = glm::lookAtRH(focus + L * 220.0f, focus, up);
+    Mat4 lproj = glm::orthoRH_ZO(-kShadowHalf, kShadowHalf, -kShadowHalf, kShadowHalf, 1.0f, 480.0f);
+    Vec4 origin = lproj * lview * Vec4(0, 0, 0, 1);
+    float texels = kShadowSize * 0.5f;
+    float sx = origin.x * texels, sy = origin.y * texels;
+    lproj[3][0] += (std::round(sx) - sx) / texels;
+    lproj[3][1] += (std::round(sy) - sy) / texels;
+    Mat4 svp = lproj * lview;
+    std::memcpy(fc.shadowVP, &svp[0][0], sizeof(fc.shadowVP));
+
+    float night = nightFactor();
+    Vec3 zen, hor;
+    skyColours(zen, hor);
+    fc.camPos[0] = c.position.x; fc.camPos[1] = c.position.y; fc.camPos[2] = c.position.z;
+    fc.camPos[3] = 0.0018f + night * 0.0012f + post.wetness * 0.004f;
+    Vec3 sd = normalize(sunDir);
+    if (sd.y < 0.04f) { sd.y = 0.04f; sd = normalize(sd); }
+    fc.sunDir[0] = sd.x; fc.sunDir[1] = sd.y; fc.sunDir[2] = sd.z;
+    fc.sunDir[3] = sunIntensity * (1.0f - post.wetness * 0.6f);
+    fc.sunColour[0] = sunColour.x; fc.sunColour[1] = sunColour.y; fc.sunColour[2] = sunColour.z;
+    fc.sunColour[3] = night;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float seconds = frequency.QuadPart
+                        ? static_cast<float>(static_cast<double>(now.QuadPart - startTime.QuadPart) /
+                                             static_cast<double>(frequency.QuadPart))
+                        : 0.0f;
+    fc.skyZenith[0] = zen.x; fc.skyZenith[1] = zen.y; fc.skyZenith[2] = zen.z;
+    fc.skyZenith[3] = std::fmod(seconds, 3600.0f);
+    float exposure = (post.exposure > 0.05f ? post.exposure : 1.1f) * (1.0f + night * 0.5f);
+    fc.skyHorizon[0] = hor.x; fc.skyHorizon[1] = hor.y; fc.skyHorizon[2] = hor.z;
+    fc.skyHorizon[3] = exposure;
+    size_t n = std::min<size_t>(lights.size(), 16);
+    fc.misc[0] = static_cast<float>(n);
+    fc.misc[1] = 1.0f / static_cast<float>(kShadowSize);
+    fc.misc[2] = sunIntensity > 0.05f ? 1.0f : 0.0f;
+    fc.misc[3] = clampf(post.wetness, 0.0f, 1.0f);
+    for (size_t i = 0; i < n; ++i) {
+        const DynamicLight& l = lights[i];
+        fc.lightPos[i][0] = l.position.x; fc.lightPos[i][1] = l.position.y;
+        fc.lightPos[i][2] = l.position.z; fc.lightPos[i][3] = l.radius;
+        fc.lightCol[i][0] = l.colour.x * l.intensity;
+        fc.lightCol[i][1] = l.colour.y * l.intensity;
+        fc.lightCol[i][2] = l.colour.z * l.intensity;
+        fc.lightCol[i][3] = (!l.isHeadlight && !l.isPolice) ? 1.0f : 0.0f;
+    }
+}
 
 D3D12Renderer::D3D12Renderer(void* hwnd, int w, int h) : impl_(std::make_unique<Impl>()) {
     impl_->hwnd = static_cast<HWND>(hwnd);
@@ -290,7 +363,7 @@ D3D12Renderer::~D3D12Renderer() {
 bool D3D12Renderer::Impl::createPipelines() {
     D3D12_DESCRIPTOR_RANGE range{};
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    range.NumDescriptors = 1;
+    range.NumDescriptors = 2;  // t0 font atlas, t1 shadow map
     range.BaseShaderRegister = 0;
     D3D12_ROOT_PARAMETER params[3]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -303,17 +376,23 @@ bool D3D12Renderer::Impl::createPipelines() {
     params[2].DescriptorTable.NumDescriptorRanges = 1;
     params[2].DescriptorTable.pDescriptorRanges = &range;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
+    samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
+    samplers[0].ShaderRegister = 0;
+    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    samplers[1] = samplers[0];
+    samplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+    samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    samplers[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
+    samplers[1].ShaderRegister = 1;
     D3D12_ROOT_SIGNATURE_DESC rs{};
     rs.NumParameters = 3;
     rs.pParameters = params;
-    rs.NumStaticSamplers = 1;
-    rs.pStaticSamplers = &sampler;
+    rs.NumStaticSamplers = 2;
+    rs.pStaticSamplers = samplers;
     rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ComPtr<ID3DBlob> blob, err;
     if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err))) {
@@ -324,21 +403,25 @@ bool D3D12Renderer::Impl::createPipelines() {
                                            IID_PPV_ARGS(&rootSig))))
         return false;
 
-    ComPtr<ID3DBlob> vs, ps, vsO, psO;
+    ComPtr<ID3DBlob> vs, ps, vsSh, vsSky, psSky, vsO, psO;
     if (!compile("VSMain", "vs_5_0", vs) || !compile("PSMain", "ps_5_0", ps) ||
+        !compile("VSShadow", "vs_5_0", vsSh) || !compile("VSSky", "vs_5_0", vsSky) ||
+        !compile("PSSky", "ps_5_0", psSky) ||
         !compile("VSOverlay", "vs_5_0", vsO) || !compile("PSOverlay", "ps_5_0", psO))
         return false;
 
     D3D12_INPUT_ELEMENT_DESC sceneLayout[] = {
-        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = rootSig.Get();
     pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
     pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-    pd.InputLayout = {sceneLayout, 1};
+    pd.InputLayout = {sceneLayout, 2};
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // procedural meshes mix windings
     pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.RasterizerState.MultisampleEnable = samples > 1;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.DepthStencilState.DepthEnable = TRUE;
     pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -346,24 +429,49 @@ bool D3D12Renderer::Impl::createPipelines() {
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 1;
-    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.RTVFormats[0] = kColourFormat;
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    pd.SampleDesc.Count = 1;
+    pd.SampleDesc.Count = samples;
     if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoScene)))) return false;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
     if (FAILED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoSceneWire)))) return false;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+
+    // Sky: a full-screen triangle behind everything (no depth test or write).
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC sky = pd;
+    sky.VS = {vsSky->GetBufferPointer(), vsSky->GetBufferSize()};
+    sky.PS = {psSky->GetBufferPointer(), psSky->GetBufferSize()};
+    sky.InputLayout = {nullptr, 0};
+    sky.DepthStencilState.DepthEnable = FALSE;
+    sky.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    if (FAILED(device->CreateGraphicsPipelineState(&sky, IID_PPV_ARGS(&psoSky)))) return false;
+
+    // Shadow casters: depth only, single sample, slope-scaled bias.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC sh = pd;
+    sh.VS = {vsSh->GetBufferPointer(), vsSh->GetBufferSize()};
+    sh.PS = {nullptr, 0};
+    sh.NumRenderTargets = 0;
+    sh.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    sh.SampleDesc.Count = 1;
+    sh.RasterizerState.MultisampleEnable = FALSE;
+    sh.RasterizerState.SlopeScaledDepthBias = 1.5f;
+    sh.RasterizerState.DepthBiasClamp = 0.01f;
+    if (FAILED(device->CreateGraphicsPipelineState(&sh, IID_PPV_ARGS(&psoShadow)))) return false;
 
     D3D12_INPUT_ELEMENT_DESC overlayLayout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
-    pd.VS = {vsO->GetBufferPointer(), vsO->GetBufferSize()};
-    pd.PS = {psO->GetBufferPointer(), psO->GetBufferSize()};
-    pd.InputLayout = {overlayLayout, 3};
-    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.DepthStencilState.DepthEnable = FALSE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    auto& bl = pd.BlendState.RenderTarget[0];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC od = pd;
+    od.VS = {vsO->GetBufferPointer(), vsO->GetBufferSize()};
+    od.PS = {psO->GetBufferPointer(), psO->GetBufferSize()};
+    od.InputLayout = {overlayLayout, 3};
+    od.SampleDesc.Count = 1;
+    od.RasterizerState.MultisampleEnable = FALSE;
+    od.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    od.DepthStencilState.DepthEnable = FALSE;
+    od.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    auto& bl = od.BlendState.RenderTarget[0];
     bl.BlendEnable = TRUE;
     bl.SrcBlend = D3D12_BLEND_SRC_ALPHA;
     bl.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
@@ -371,7 +479,41 @@ bool D3D12Renderer::Impl::createPipelines() {
     bl.SrcBlendAlpha = D3D12_BLEND_ONE;
     bl.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
     bl.BlendOpAlpha = D3D12_BLEND_OP_ADD;
-    return SUCCEEDED(device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&psoOverlay)));
+    return SUCCEEDED(device->CreateGraphicsPipelineState(&od, IID_PPV_ARGS(&psoOverlay)));
+}
+
+// Off-screen targets: the (multisampled) scene colour + depth and the sun
+// shadow map. RTV slot kFrames is the scene colour; DSV 0 scene, 1 shadow.
+bool D3D12Renderer::Impl::createTargets() {
+    D3D12_CLEAR_VALUE cc{};
+    cc.Format = kColourFormat;
+    D3D12_CLEAR_VALUE dc{};
+    dc.Format = DXGI_FORMAT_D32_FLOAT;
+    dc.DepthStencil.Depth = 1.0f;
+    UINT w = static_cast<UINT>(width), h = static_cast<UINT>(height);
+    sceneColour = makeTexture(device.Get(), kColourFormat, w, h, samples, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET, &cc);
+    sceneDepth = makeTexture(device.Get(), DXGI_FORMAT_D32_FLOAT, w, h, samples,
+                             D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc);
+    shadowMap = makeTexture(device.Get(), DXGI_FORMAT_R32_TYPELESS, kShadowSize, kShadowSize, 1,
+                            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc);
+    if (!sceneColour || !sceneDepth || !shadowMap) return false;
+    shadowState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    device->CreateRenderTargetView(sceneColour.Get(), nullptr, rtv(kFrames));
+    device->CreateDepthStencilView(sceneDepth.Get(), nullptr, dsv(0));
+    D3D12_DEPTH_STENCIL_VIEW_DESC sdv{};
+    sdv.Format = DXGI_FORMAT_D32_FLOAT;
+    sdv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    device->CreateDepthStencilView(shadowMap.Get(), &sdv, dsv(1));
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R32_FLOAT;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = srvHeap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += srvStride;
+    device->CreateShaderResourceView(shadowMap.Get(), &sv, slot);
+    return true;
 }
 
 // Renders printable ASCII with GDI into a DIB, then uploads the coverage as
@@ -470,6 +612,8 @@ bool D3D12Renderer::init() {
     ComPtr<ID3D12Debug> debug;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) debug->EnableDebugLayer();
 #endif
+    QueryPerformanceFrequency(&d.frequency);
+    QueryPerformanceCounter(&d.startTime);
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
         Logger::error("D3D12: CreateDXGIFactory2 failed");
@@ -483,11 +627,23 @@ bool D3D12Renderer::init() {
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(d.device->CreateCommandQueue(&qd, IID_PPV_ARGS(&d.queue)))) return false;
 
+    // 4x MSAA when the GPU supports it for both targets, otherwise none.
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS ms{};
+    ms.Format = kColourFormat;
+    ms.SampleCount = 4;
+    bool colourOk = SUCCEEDED(d.device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof(ms))) &&
+                    ms.NumQualityLevels > 0;
+    ms.Format = DXGI_FORMAT_D32_FLOAT;
+    ms.NumQualityLevels = 0;
+    bool depthOk = SUCCEEDED(d.device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &ms, sizeof(ms))) &&
+                   ms.NumQualityLevels > 0;
+    d.samples = colourOk && depthOk ? 4 : 1;
+
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.BufferCount = kFrames;
     sd.Width = static_cast<UINT>(d.width);
     sd.Height = static_cast<UINT>(d.height);
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.Format = kColourFormat;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.SampleDesc.Count = 1;
@@ -499,7 +655,7 @@ bool D3D12Renderer::init() {
     d.frameIndex = d.swapChain->GetCurrentBackBufferIndex();
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.NumDescriptors = kFrames;
+    hd.NumDescriptors = kFrames + 1;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.rtvHeap)))) return false;
     d.rtvStride = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -510,32 +666,17 @@ bool D3D12Renderer::init() {
                                                     IID_PPV_ARGS(&d.allocators[i]))))
             return false;
     }
-    hd.NumDescriptors = 1;
+    hd.NumDescriptors = 2;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.dsvHeap)))) return false;
+    d.dsvStride = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    hd.NumDescriptors = 2;
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(d.device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&d.srvHeap)))) return false;
+    d.srvStride = d.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC dd{};
-    dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    dd.Width = static_cast<UINT64>(d.width);
-    dd.Height = static_cast<UINT>(d.height);
-    dd.DepthOrArraySize = 1; dd.MipLevels = 1;
-    dd.Format = DXGI_FORMAT_D32_FLOAT;
-    dd.SampleDesc.Count = 1;
-    dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    D3D12_CLEAR_VALUE cv{};
-    cv.Format = DXGI_FORMAT_D32_FLOAT;
-    cv.DepthStencil.Depth = 1.0f;
-    if (FAILED(d.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
-                                                 D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
-                                                 IID_PPV_ARGS(&d.depth))))
-        return false;
-    d.device->CreateDepthStencilView(d.depth.Get(), nullptr, d.dsvHeap->GetCPUDescriptorHandleForHeapStart());
-
+    if (!d.createTargets()) { Logger::error("D3D12: render target creation failed"); return false; }
     if (FAILED(d.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, d.allocators[0].Get(),
                                            nullptr, IID_PPV_ARGS(&d.cmd))))
         return false;
@@ -548,7 +689,8 @@ bool D3D12Renderer::init() {
     if (!d.ring || FAILED(d.ring->Map(0, &none, reinterpret_cast<void**>(&d.ringCpu)))) return false;
     if (!d.createPipelines()) { Logger::error("D3D12: pipeline creation failed"); return false; }
     if (!d.createFontAtlas()) { Logger::error("D3D12: font atlas creation failed"); return false; }
-    Logger::info("D3D12 renderer initialised (" + std::to_string(d.width) + "x" + std::to_string(d.height) + ")");
+    Logger::info("D3D12 renderer initialised (" + std::to_string(d.width) + "x" + std::to_string(d.height) +
+                 ", " + std::to_string(d.samples) + "x MSAA, " + std::to_string(kShadowSize) + " shadow map)");
     return true;
 }
 
@@ -557,85 +699,50 @@ void D3D12Renderer::beginFrame() {
     if (d.frameOpen) return; // the game and the app may both start the frame
     d.frameOpen = true;
     d.draws = 0;
+    d.items.clear();
     d.overlay.clear();
     d.ringOffset = 0;
     if (d.fence->GetCompletedValue() < d.frameFence[d.frameIndex]) {
         d.fence->SetEventOnCompletion(d.frameFence[d.frameIndex], d.fenceEvent);
         WaitForSingleObject(d.fenceEvent, INFINITE);
     }
-    d.allocators[d.frameIndex]->Reset();
-    d.cmd->Reset(d.allocators[d.frameIndex].Get(), d.wireframe ? d.psoSceneWire.Get() : d.psoScene.Get());
-    transition(d.cmd.Get(), d.backBuffers[d.frameIndex].Get(), D3D12_RESOURCE_STATE_PRESENT,
-               D3D12_RESOURCE_STATE_RENDER_TARGET);
-    Vec3 sky = d.sky();
-    // Same curve the pixel shader applies, so distant fog meets the clear colour.
-    const float clear[4] = {std::pow(sky.x, 0.8f), std::pow(sky.y, 0.8f), std::pow(sky.z, 0.8f), 1.0f};
-    auto rtv = d.rtv(d.frameIndex);
-    auto dsv = d.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    d.cmd->ClearRenderTargetView(rtv, clear, 0, nullptr);
-    d.cmd->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    d.cmd->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    D3D12_VIEWPORT vp{0, 0, static_cast<float>(d.width), static_cast<float>(d.height), 0, 1};
-    D3D12_RECT sc{0, 0, d.width, d.height};
-    d.cmd->RSSetViewports(1, &vp);
-    d.cmd->RSSetScissorRects(1, &sc);
-    d.cmd->SetGraphicsRootSignature(d.rootSig.Get());
-    ID3D12DescriptorHeap* heaps[] = {d.srvHeap.Get()};
-    d.cmd->SetDescriptorHeaps(1, heaps);
-    d.cmd->SetGraphicsRootDescriptorTable(2, d.srvHeap->GetGPUDescriptorHandleForHeapStart());
-    d.cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    // Frame constants. Depth range 0..1 (Direct3D), right-handed like the game.
-    FrameConstants fc{};
-    const Camera& c = d.camera;
-    Mat4 proj = glm::perspectiveRH_ZO(glm::radians(c.fov), static_cast<float>(d.width) / d.height,
-                                      std::max(c.nearPlane, 0.1f), c.farPlane);
-    Mat4 vpm = proj * c.view();
-    std::memcpy(fc.viewProj, &vpm[0][0], sizeof(fc.viewProj));
-    float night = 1.0f - clampf((d.sunIntensity - 0.25f) / 0.75f, 0.0f, 1.0f);
-    fc.camPos[0] = c.position.x; fc.camPos[1] = c.position.y; fc.camPos[2] = c.position.z;
-    fc.camPos[3] = 0.0022f + night * 0.002f;
-    fc.sunDir[0] = d.sunDir.x; fc.sunDir[1] = d.sunDir.y; fc.sunDir[2] = d.sunDir.z;
-    fc.sunDir[3] = d.sunIntensity;
-    fc.sunColour[0] = d.sunColour.x; fc.sunColour[1] = d.sunColour.y; fc.sunColour[2] = d.sunColour.z;
-    fc.sunColour[3] = night;
-    fc.skyColour[0] = sky.x; fc.skyColour[1] = sky.y; fc.skyColour[2] = sky.z; fc.skyColour[3] = 1;
-    void* cpu = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
-    if (d.alloc(sizeof(fc), 256, cpu, gpu)) {
-        std::memcpy(cpu, &fc, sizeof(fc));
-        d.cmd->SetGraphicsRootConstantBufferView(0, gpu);
-    }
 }
 
+
 void D3D12Renderer::drawMesh(const MeshData& mesh, const Mat4& model, const Vec3& colour) {
-    auto& d = *impl_;
+    // Colours above 1 (lamps, head/tail lights) glow instead of clipping.
+    float peak = std::max(colour.x, std::max(colour.y, colour.z));
+    float emissive = peak > 1.0f ? peak - 1.0f : 0.0f;
+    Vec3 albedo = peak > 1.0f ? colour / peak : colour;
+    const float c[4] = {albedo.x, albedo.y, albedo.z, emissive};
+    const float p[4] = {0.0f, 0.6f, static_cast<float>(kShadeStandard), 0.0f};
+    impl_->submit(mesh, model, c, p, true);
+}
+
+void D3D12Renderer::drawMeshPBR(const MeshData& mesh, const Mat4& model, const Material& mat) {
+    float glow = std::max(mat.emissive.x, std::max(mat.emissive.y, mat.emissive.z));
+    const float c[4] = {mat.albedo.x, mat.albedo.y, mat.albedo.z, glow};
+    const float p[4] = {mat.metalness, mat.roughness, static_cast<float>(mat.shading), mat.variant};
+    bool casts = mat.shading != kShadeGround && mat.shading != kShadeEmissive;
+    impl_->submit(mesh, model, c, p, casts);
+}
+
+void D3D12Renderer::Impl::submit(const MeshData& mesh, const Mat4& model, const float colour[4],
+                                 const float params[4], bool castsShadow) {
+    auto& d = *this;
     if (!d.frameOpen || mesh.positions.empty() || mesh.indices.empty()) return;
     GpuMesh* g = d.mesh(mesh);
     if (!g) return;
     DrawConstants dc{};
     std::memcpy(dc.model, &model[0][0], sizeof(dc.model));
-    // Colours above 1 (lamps, head/tail lights) glow instead of clipping.
-    float peak = std::max(colour.x, std::max(colour.y, colour.z));
-    float emissive = peak > 1.0f ? peak - 1.0f : 0.0f;
-    Vec3 albedo = peak > 1.0f ? colour / peak : colour;
-    dc.colour[0] = albedo.x; dc.colour[1] = albedo.y; dc.colour[2] = albedo.z; dc.colour[3] = emissive;
+    std::memcpy(dc.colour, colour, sizeof(dc.colour));
+    std::memcpy(dc.params, params, sizeof(dc.params));
     void* cpu = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
     if (!d.alloc(sizeof(dc), 256, cpu, gpu)) return;
     std::memcpy(cpu, &dc, sizeof(dc));
-    d.cmd->SetGraphicsRootConstantBufferView(1, gpu);
-    d.cmd->IASetVertexBuffers(0, 1, &g->vbv);
-    d.cmd->IASetIndexBuffer(&g->ibv);
-    d.cmd->DrawIndexedInstanced(g->indexCount, 1, 0, 0, 0);
+    d.items.push_back({g, gpu, castsShadow});
     ++d.draws;
-}
-
-void D3D12Renderer::drawMeshPBR(const MeshData& mesh, const Mat4& model, const Material& mat) {
-    Vec3 c = mat.albedo;
-    float glow = std::max(mat.emissive.x, std::max(mat.emissive.y, mat.emissive.z));
-    if (glow > 0.0f) c = c * (1.0f + glow);
-    drawMesh(mesh, model, c);
 }
 
 void D3D12Renderer::drawRect2D(float x, float y, float w, float h, const Vec4& col) {
@@ -679,41 +786,192 @@ void D3D12Renderer::drawText2D(float x, float y, float size, const std::string& 
     }
 }
 
+
 void D3D12Renderer::setCamera(const Camera& cam) { impl_->camera = cam; }
 void D3D12Renderer::setSun(const Vec3& dir, const Vec3& colour, float intensity) {
     impl_->sunDir = dir;
     impl_->sunColour = colour;
     impl_->sunIntensity = intensity;
 }
-void D3D12Renderer::setLights(const LightRig&) {}
-void D3D12Renderer::setPostSettings(const PostSettings&) {}
+void D3D12Renderer::setLights(const LightRig& rig) {
+    impl_->lights.assign(rig.lights.begin(),
+                         rig.lights.begin() + static_cast<std::ptrdiff_t>(std::min<size_t>(rig.lights.size(), 16)));
+}
+void D3D12Renderer::setPostSettings(const PostSettings& s) { impl_->post = s; }
 void D3D12Renderer::setWireframe(bool on) { impl_->wireframe = on; }
 
 void D3D12Renderer::present() {
     auto& d = *impl_;
     if (!d.frameOpen) beginFrame(); // menus with no 3D pass still get a frame
+    ID3D12GraphicsCommandList* c = d.cmd.Get();
+    d.allocators[d.frameIndex]->Reset();
+    c->Reset(d.allocators[d.frameIndex].Get(), d.psoShadow.Get());
+
+    FrameConstants fc;
+    d.buildFrameConstants(fc);
+    void* cpu = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS frameCb = 0;
+    bool haveFrame = d.alloc(sizeof(fc), 256, cpu, frameCb);
+    if (haveFrame) std::memcpy(cpu, &fc, sizeof(fc));
+
+    c->SetGraphicsRootSignature(d.rootSig.Get());
+    ID3D12DescriptorHeap* heaps[] = {d.srvHeap.Get()};
+    c->SetDescriptorHeaps(1, heaps);
+    c->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (haveFrame) c->SetGraphicsRootConstantBufferView(0, frameCb);
+
+    // 1. Sun shadow map.
+    transition(c, d.shadowMap.Get(), d.shadowState, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    auto shadowDsv = d.dsv(1);
+    c->ClearDepthStencilView(shadowDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    if (haveFrame && fc.misc[2] > 0.5f && !d.items.empty()) {
+        c->OMSetRenderTargets(0, nullptr, FALSE, &shadowDsv);
+        D3D12_VIEWPORT svp{0, 0, static_cast<float>(kShadowSize), static_cast<float>(kShadowSize), 0, 1};
+        D3D12_RECT ssc{0, 0, static_cast<LONG>(kShadowSize), static_cast<LONG>(kShadowSize)};
+        c->RSSetViewports(1, &svp);
+        c->RSSetScissorRects(1, &ssc);
+        for (const auto& it : d.items) {
+            if (!it.castsShadow) continue;
+            c->SetGraphicsRootConstantBufferView(1, it.constants);
+            c->IASetVertexBuffers(0, 1, &it.mesh->vbv);
+            c->IASetIndexBuffer(&it.mesh->ibv);
+            c->DrawIndexedInstanced(it.mesh->indexCount, 1, 0, 0, 0);
+        }
+    }
+    transition(c, d.shadowMap.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    d.shadowState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    // 2. Sky + scene into the multisampled target.
+    auto sceneRtv = d.rtv(kFrames);
+    auto sceneDsv = d.dsv(0);
+    const float black[4] = {0, 0, 0, 1};
+    c->ClearRenderTargetView(sceneRtv, black, 0, nullptr);
+    c->ClearDepthStencilView(sceneDsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    c->OMSetRenderTargets(1, &sceneRtv, FALSE, &sceneDsv);
+    D3D12_VIEWPORT vp{0, 0, static_cast<float>(d.width), static_cast<float>(d.height), 0, 1};
+    D3D12_RECT sc{0, 0, d.width, d.height};
+    c->RSSetViewports(1, &vp);
+    c->RSSetScissorRects(1, &sc);
+    c->SetGraphicsRootDescriptorTable(2, d.srvHeap->GetGPUDescriptorHandleForHeapStart());
+    if (haveFrame) {
+        c->SetPipelineState(d.psoSky.Get());
+        c->DrawInstanced(3, 1, 0, 0);
+        c->SetPipelineState(d.wireframe ? d.psoSceneWire.Get() : d.psoScene.Get());
+        for (const auto& it : d.items) {
+            c->SetGraphicsRootConstantBufferView(1, it.constants);
+            c->IASetVertexBuffers(0, 1, &it.mesh->vbv);
+            c->IASetIndexBuffer(&it.mesh->ibv);
+            c->DrawIndexedInstanced(it.mesh->indexCount, 1, 0, 0, 0);
+        }
+    }
+
+    // 3. Resolve into the back buffer, then the 2D overlay on top.
+    ID3D12Resource* back = d.backBuffers[d.frameIndex].Get();
+    if (d.samples > 1) {
+        transition(c, d.sceneColour.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        transition(c, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        c->ResolveSubresource(back, 0, d.sceneColour.Get(), 0, kColourFormat);
+        transition(c, back, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transition(c, d.sceneColour.Get(), D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    } else {
+        transition(c, d.sceneColour.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(c, back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+        c->CopyResource(back, d.sceneColour.Get());
+        transition(c, back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transition(c, d.sceneColour.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
+    auto backRtv = d.rtv(d.frameIndex);
+    c->OMSetRenderTargets(1, &backRtv, FALSE, nullptr);
     if (!d.overlay.empty()) {
         UINT64 bytes = d.overlay.size() * sizeof(OverlayVertex);
-        void* cpu = nullptr;
         D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
         if (d.alloc(bytes, 16, cpu, gpu)) {
             std::memcpy(cpu, d.overlay.data(), bytes);
             D3D12_VERTEX_BUFFER_VIEW vbv{gpu, static_cast<UINT>(bytes), sizeof(OverlayVertex)};
-            d.cmd->SetPipelineState(d.psoOverlay.Get());
-            d.cmd->IASetVertexBuffers(0, 1, &vbv);
-            d.cmd->DrawInstanced(static_cast<UINT>(d.overlay.size()), 1, 0, 0);
+            c->SetPipelineState(d.psoOverlay.Get());
+            c->IASetVertexBuffers(0, 1, &vbv);
+            c->DrawInstanced(static_cast<UINT>(d.overlay.size()), 1, 0, 0);
         }
     }
-    transition(d.cmd.Get(), d.backBuffers[d.frameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-               D3D12_RESOURCE_STATE_PRESENT);
-    d.cmd->Close();
-    ID3D12CommandList* lists[] = {d.cmd.Get()};
+    bool capture = !d.screenshotPath.empty();
+    if (capture) {
+        D3D12_RESOURCE_DESC bd = back->GetDesc();
+        UINT rows = 0; UINT64 rowBytes = 0, total = 0;
+        d.device->GetCopyableFootprints(&bd, 0, 1, 0, &d.readbackFootprint, &rows, &rowBytes, &total);
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = total; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.readback.Reset();
+        if (SUCCEEDED(d.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                        nullptr, IID_PPV_ARGS(&d.readback)))) {
+            transition(c, back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = back;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.pResource = d.readback.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = d.readbackFootprint;
+            c->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(c, back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        } else {
+            capture = false;
+            d.screenshotPath.clear();
+        }
+    }
+    transition(c, back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+    c->Close();
+    ID3D12CommandList* lists[] = {c};
     d.queue->ExecuteCommandLists(1, lists);
+    if (capture) { d.waitIdle(); d.saveReadback(); }
     d.swapChain->Present(1, 0); // vsync
     d.frameFence[d.frameIndex] = ++d.fenceCounter;
     d.queue->Signal(d.fence.Get(), d.fenceCounter);
     d.frameIndex = d.swapChain->GetCurrentBackBufferIndex();
     d.frameOpen = false;
+}
+
+bool D3D12Renderer::requestScreenshot(const std::string& path) {
+    impl_->screenshotPath = path;
+    return true;
+}
+// Writes the read-back RGBA frame as a bottom-up 24-bit BMP.
+void D3D12Renderer::Impl::saveReadback() {
+    std::string path = screenshotPath;
+    screenshotPath.clear();
+    UINT8* data = nullptr;
+    D3D12_RANGE all{0, static_cast<SIZE_T>(readbackFootprint.Footprint.RowPitch) * readbackFootprint.Footprint.Height};
+    if (FAILED(readback->Map(0, &all, reinterpret_cast<void**>(&data)))) return;
+    int w = static_cast<int>(readbackFootprint.Footprint.Width), h = static_cast<int>(readbackFootprint.Footprint.Height);
+    int rowOut = (w * 3 + 3) & ~3;
+    std::vector<UINT8> px(static_cast<size_t>(rowOut) * h, 0);
+    for (int y = 0; y < h; ++y) {
+        const UINT8* src = data + readbackFootprint.Offset + static_cast<size_t>(y) * readbackFootprint.Footprint.RowPitch;
+        UINT8* dst = px.data() + static_cast<size_t>(h - 1 - y) * rowOut;
+        for (int x = 0; x < w; ++x) {
+            dst[x * 3 + 0] = src[x * 4 + 2];
+            dst[x * 3 + 1] = src[x * 4 + 1];
+            dst[x * 3 + 2] = src[x * 4 + 0];
+        }
+    }
+    D3D12_RANGE none{0, 0};
+    readback->Unmap(0, &none);
+    BITMAPFILEHEADER fh{};
+    BITMAPINFOHEADER ih{};
+    ih.biSize = sizeof(ih); ih.biWidth = w; ih.biHeight = h; ih.biPlanes = 1; ih.biBitCount = 24;
+    ih.biCompression = BI_RGB; ih.biSizeImage = static_cast<DWORD>(px.size());
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+    fh.bfSize = fh.bfOffBits + ih.biSizeImage;
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) { Logger::error("Screenshot: cannot write " + path); return; }
+    fwrite(&fh, sizeof(fh), 1, f);
+    fwrite(&ih, sizeof(ih), 1, f);
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
+    Logger::info("Screenshot saved: " + path);
 }
 
 void D3D12Renderer::resize(int w, int h) { (void)w; (void)h; } // fixed-size window

@@ -75,6 +75,7 @@ public:
     bool isMuted() const { return muted_; }
     void cycleCamera() { cameraMode_ = (cameraMode_ + 1) % 3; hud_.cameraMode = cameraMode_; }
     void togglePhotoMode();
+    void setPhotoCamera(float yaw, float pitch, float dist) { photoYaw_ = player_.yaw() + yaw; photoPitch_ = pitch; photoDist_ = dist; }
     void toggleRadio() { radio_.nextStation(); }
     JobSystem& jobs() { return jobs_; }
     Registry& registry() { return registry_; }
@@ -90,6 +91,10 @@ private:
     void pollHotReload();
     void drawCar(IRenderer& renderer, const Vehicle& v, const Vec3& colour,
                  const std::string& carClass, bool headlightsOn);
+    void drawCarStyled(IRenderer& renderer, const Vehicle& v, const Vec3& colour, const std::string& carClass,
+                       bool headlightsOn, bool police, bool drawGlass);
+    void drawPerson(IRenderer& renderer, const Vec3& feet, float yaw, float phase, float moving, size_t lookIndex);
+    void drawCity(IRenderer& renderer, const Camera& cam);
     Vec3 paintColour(int paintIndex, const std::string& baseColour) const;
     Config config_;
     City city_;
@@ -133,6 +138,8 @@ private:
     float photoYaw_ = 0.0f, photoPitch_ = 0.4f, photoDist_ = 14.0f;
     float playTimeMinutes_ = 0.0f;
     float screenShake_ = 0.0f;
+    Vec3 lastFootPos_{0, 0, 0};    // on-foot walk animation
+    float footPhase_ = 0.0f, footMoving_ = 0.0f;
     float speedBefore_ = 0.0f;
     float lastAirTimeSeen_ = 0.0f;
     int activeMissionLua_ = -1;

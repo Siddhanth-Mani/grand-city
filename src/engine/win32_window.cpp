@@ -51,7 +51,7 @@ public:
             style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
             nullptr, nullptr, inst, nullptr);
         if (!hwnd_) { Logger::error("CreateWindowEx failed"); return false; }
-        ShowWindow(hwnd_, SW_SHOW);
+        ShowWindow(hwnd_, d.noActivate ? SW_SHOWNOACTIVATE : SW_SHOW);
         Logger::info("Win32 window created");
         return true;
     }

@@ -18,6 +18,7 @@ struct PostSettings {
     float bloomStrength = 0.6f;
     bool msaa = false; // 4x MSAA on the main target (backend option)
     int msaaSamples = 4;
+    float wetness = 0.0f; // 0 dry .. 1 soaked: darker, glossier roads
 };
 struct PostPass {
     std::string name;

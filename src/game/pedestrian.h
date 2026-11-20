@@ -8,6 +8,9 @@ struct Pedestrian {
     Vec3 waypoint{0, 0, 0};
     float speed = 1.4f;
     bool fleeing = false;
+    float yaw = 0.0f;      // facing, radians (0 = +z)
+    float phase = 0.0f;    // walk cycle, advances with distance walked
+    float moving = 0.0f;   // 0 standing .. 1 walking, 2 running (animation)
 };
 class Pedestrians {
 public:
@@ -20,7 +23,11 @@ public:
                 const std::vector<Vec3>& carPositions,
                 const std::vector<Vec3>& carForward);
     const std::vector<Pedestrian>& all() const { return peds_; }
+    // Pedestrians walk the pavements: corner to corner along a block, or
+    // across the road on the zebra crossings. Offset from the road centre.
+    static constexpr float kPavementOffset = 9.3f;
 private:
+    void nextWaypoint(Pedestrian& p);
     std::vector<Pedestrian> peds_;
     const City* city_ = nullptr;
 };

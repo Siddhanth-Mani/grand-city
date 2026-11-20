@@ -36,6 +36,9 @@ public:
     virtual void setLights(const LightRig& rig) { (void)rig; }
     virtual void setPostSettings(const PostSettings& s) { (void)s; }
     virtual void setWireframe(bool) {}
+    // Saves the next presented frame (3D + overlay) as a 24-bit BMP.
+    // Backends without a GPU frame return false.
+    virtual bool requestScreenshot(const std::string& path) { (void)path; return false; }
     // --- 2D overlay (menus, HUD). Coordinates are pixels on a virtual
     // 1280x720 canvas, scaled to the window; drawn on top of the 3D frame.
     // Backends without an overlay (null) ignore them. ---

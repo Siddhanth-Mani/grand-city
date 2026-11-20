@@ -11,9 +11,17 @@ Original content only — fictional city, cars and characters. No third-party
 game content, assets or branding, and no real car brands, badges or licensed
 models appear anywhere.
 
-| Title menu | Garage |
+| Night, street lamps and headlights | Golden hour |
 |---|---|
+| ![Night](docs/screenshots/night.jpg) | ![Golden hour](docs/screenshots/golden.jpg) |
+| **On foot** | **Above the city** |
+| ![On foot](docs/screenshots/street.jpg) | ![Aerial](docs/screenshots/aerial.jpg) |
+| **Title menu** | **Garage** |
 | ![Title menu](docs/screenshots/title.jpg) | ![Garage](docs/screenshots/garage.jpg) |
+
+Every image above is a real frame from the Direct3D 12 renderer, captured
+in-engine with `--shot` (see *Screenshots* below). Everything you see is
+built in code at start-up: no meshes, textures or photos are loaded.
 
 ## Finished game — how to play start to finish
 
@@ -93,8 +101,10 @@ in Settings.
 | Story | Original 6-mission campaign with cutscenes, unlocks, star ratings (`src/game/story.h`) |
 | Engine | Fixed 60 Hz physics loop, Win32 window, resource manager, scene graph, ECS + job system |
 | Renderers | Direct3D 12 (Windows, playable), Null (headless/Linux/CI), Vulkan (Windows + SDK, partial), Metal (macOS, minimal stub) |
-| Rendering (D3D12) | Flat-shaded lit scene (sun + sky/ground ambient, distance fog, day/night sky), procedural road grid with lane markings, pavements, beach and sea; 2D overlay for menus, HUD and minimap with a GDI-built font atlas; 2 frames in flight with a per-frame upload ring |
-| Shader library | PBR (Cook-Torrance), shadow-map PCF and post-processing shaders in `shaders/`, validated by the null renderer — not yet wired into the D3D12 path |
+| Rendering (D3D12) | Physically based lighting (GGX specular, Schlick Fresnel, clear-coat car paint), 2048² sun shadow map with 3×3 PCF, 4× MSAA, ACES tone mapping; procedural sky with sun, moon, clouds and stars; 16 point lights (street lamps cast downward pools, headlights, police bars); day/night cycle with golden hour and lit windows; wet roads in rain; 2D overlay for menus, HUD and minimap |
+| Procedural city | Concrete, glass, brick and stone facades with shopfronts and signs; podium towers with crowns, rooftop plant and blinking aircraft lights; asphalt with lane markings, zebra crossings and kerbs; pavements with street lamps, trees and traffic signals |
+| Procedural cars and people | Eight body styles (sedan, hatch, sports, supercar, muscle, SUV, pickup, van) lofted from side profiles with wheel arches, separate glass, grille, mirrors, plates, light bars and five-spoke rims; articulated pedestrians with a walk cycle who use the pavements and crossings |
+| Shader library | Standalone PBR, shadow and post-processing shaders in `shaders/` for the Vulkan path, validated by the null renderer; the D3D12 shader lives in `src/renderer/d3d12/d3d12_shaders.h` |
 | Physics | Full drivetrain (torque curve, gearbox, clutch slip, differential), Pacejka tyres, per-wheel raycast suspension, weight transfer, aero drag + downforce, brake fade, ABS/TC/ESP assists, surface grip (tarmac/wet/gravel), damage model, OBB + swept collision |
 | AI | A* pathfinding on the road graph for traffic and police, lane-changing, yielding at intersections, pedestrian avoidance, police roadblocks at 3+ stars |
 | Audio | Vendored miniaudio: positional engine/skid/siren/crash/backfire/pickup sounds + 3-station synthesised radio |
@@ -182,6 +192,21 @@ tests/                  portable test program (null renderer) — 148 checks
    `game.failMission(reason)`, `game.setTimer(s)`, `game.timeLeft()`,
    `game.setWanted(n)`, plus `onStuntJump(airTime)` for stunt missions.
 
+## Screenshots
+
+The game can capture a frame itself, without taking over the desktop:
+
+```powershell
+.\build\Release\grand-city-6.exe --shot night.bmp --hour 21.5 --drive 0.6 --wait 240 --no-hud
+```
+
+Options: `--hour H` (time of day), `--weather rain`, `--drive T` and
+`--steer S` (scripted throttle and steering), `--wait N` (frames before the
+capture), `--camera N` (press the camera key N times), `--photo YAW PITCH DIST`
+(orbit camera), `--no-hud`. The window opens without taking focus, runs a fixed 60 Hz
+simulation, writes a BMP and exits. `startHour` in `data/settings.ini` sets
+the time a new game starts at.
+
 ## Verification
 
 ### Windows (2026-11-20, Windows 11, MSVC 19.44, Direct3D 12)
@@ -214,9 +239,11 @@ tests/                  portable test program (null renderer) — 148 checks
 
 ## Honest limits
 
-- **The D3D12 renderer is deliberately simple**: flat shading, fog and a
-  2D overlay. The PBR, shadow and post-processing shaders exist but are not
-  yet used by it, and there is no MSAA.
+- **The look is procedural, not photo-scanned**: lighting, shadows and
+  materials are physically based, but buildings, cars and people are built
+  from code, so close up they read as clean low-poly models rather than
+  photographs. There are no reflections of the actual scene (sky and
+  street colour are approximated), no screen-space effects and no textures.
 - **The Vulkan backend has not been compiled** (no Vulkan SDK on the build
   machines) and is not feature-complete; Windows builds use D3D12.
 - The Metal backend is a **labelled minimal stub** — it needs a Mac with
@@ -227,5 +254,4 @@ tests/                  portable test program (null renderer) — 148 checks
   is skipped there (the protocol round-trip is tested instead).
 - This is a complete, polished, original open-world game built on the
   engine — the closest achievable in this format. It is **not a finished
-  AAA game**: the 3D is stylised procedural geometry, not photorealism, and
-  the real graphics need a Windows PC with a Direct3D 12 GPU.
+  AAA game**, and the real graphics need a Windows PC with a Direct3D 12 GPU.

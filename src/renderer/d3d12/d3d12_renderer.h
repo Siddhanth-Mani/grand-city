@@ -21,6 +21,7 @@ public:
     void setLights(const LightRig& rig) override;
     void setPostSettings(const PostSettings& s) override;
     void setWireframe(bool on) override;
+    bool requestScreenshot(const std::string& path) override;
     void drawRect2D(float x, float y, float w, float h, const Vec4& colour) override;
     void drawText2D(float x, float y, float size, const std::string& text, const Vec4& colour) override;
 private:
